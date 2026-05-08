@@ -1,0 +1,14 @@
+[project]
+name = "mujoco-ocp"
+version = "0.1.0"
+description = "Minimal MuJoCo OCP experiments with Unitree G1 and Robotiq 2F85 v4"
+requires-python = ">=3.11"
+dependencies = [
+    "mujoco>=3.6.0",
+    "numpy>=2.4.3",
+    "casadi>=3.7.2",
+    "pin>=4.0.0",
+]
+
+[tool.setuptools]
+packages = []
