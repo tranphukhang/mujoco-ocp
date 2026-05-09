@@ -165,9 +165,7 @@ class FastDualEEOCP:
     """
     Fast multi-stage dual-end-effector reaching OCP.
 
-    Design goal:
-        Generate reference trajectories for RL reward shaping.
-        Prioritize speed and stability over heavy planner accuracy.
+    This implementation uses implicit midpoint transcription only.
 
     Build once, solve many:
         build_problem() creates the NLP graph and IPOPT solver once.
@@ -176,44 +174,32 @@ class FastDualEEOCP:
             - X0 fixed through lbx/ubx
             - initial guess w0
 
-    dynamics_mode:
-        "explicit_hs":
-            Explicit Hermite-Simpson:
-                xdot = f(x, u) = [v; ABA(q, v, u)]
+    Variables:
+        Tf
+        X_k = [q_k; v_k] in R34, k = 0,...,N
+        U_k = tau_k       in R17, k = 0,...,N
 
-        "implicit_midpoint":
-            Implicit midpoint:
-                x_mid = 0.5 * (x_k + x_{k+1})
-                u_mid = 0.5 * (u_k + u_{k+1})
-                xdot_mid = (x_{k+1} - x_k) / h
+    Parameter:
+        P = p_ref = [p_left_ref; p_right_ref] in R6
 
-                residual = F(x_mid, xdot_mid, u_mid) = 0
+    Implicit midpoint dynamics on each interval k:
 
-            where:
-                F = [
-                    qdot - v
-                    RNEA(q, v, vdot) - u
-                ]
+        x_mid    = 0.5 * (X_k + X_{k+1})
+        u_mid    = 0.5 * (U_k + U_{k+1})
+        xdot_mid = (X_{k+1} - X_k) / h
 
-    graph_mode:
-        Only used by dynamics_mode="explicit_hs".
+        F_impl(x_mid, xdot_mid, u_mid) = 0
 
-        "naive":
-            Every interval calls fk, fkp1, fc and Lk, Lc, Lkp1 directly.
+    where:
 
-        "reuse_dynamics":
-            Precompute node dynamics F_nodes[k] = f_dyn(X[k], U[k]).
+        F_impl =
+        [
+            qdot_mid - v_mid
+            RNEA(q_mid, v_mid, vdot_mid) - u_mid
+        ]
 
-        "reuse_dynamics_and_cost":
-            Precompute both node dynamics and node stage costs.
-
-    This version intentionally has:
-        - no collision constraints
-        - no SQP outer loop
-        - no trust region
-        - no hard terminal EE equality
-        - no posture cost
-        - no gripper decision variables
+    This avoids ABA in the NLP constraints and uses only one implicit
+    dynamics residual per interval.
     """
 
     def __init__(
@@ -224,8 +210,6 @@ class FastDualEEOCP:
         config: FastDualEEOCPConfig | None = None,
         solver_name: str = "ipopt",
         solver_options: dict[str, Any] | None = None,
-        graph_mode: str = "reuse_dynamics_and_cost",
-        dynamics_mode: str = "explicit_hs",
     ) -> None:
         if config is None:
             config = get_default_fast_dual_ee_ocp_config()
@@ -246,29 +230,6 @@ class FastDualEEOCP:
                 f"cfg nq={config.nq}, nv={config.nv}"
             )
 
-        valid_graph_modes = {
-            "naive",
-            "reuse_dynamics",
-            "reuse_dynamics_and_cost",
-        }
-
-        if graph_mode not in valid_graph_modes:
-            raise ValueError(
-                f"graph_mode must be one of {sorted(valid_graph_modes)}, "
-                f"got {graph_mode!r}"
-            )
-
-        valid_dynamics_modes = {
-            "explicit_hs",
-            "implicit_midpoint",
-        }
-
-        if dynamics_mode not in valid_dynamics_modes:
-            raise ValueError(
-                f"dynamics_mode must be one of {sorted(valid_dynamics_modes)}, "
-                f"got {dynamics_mode!r}"
-            )
-
         self.dynamics = dynamics
         self.kinematics = kinematics
         self.config = config
@@ -282,8 +243,7 @@ class FastDualEEOCP:
         self.num_nodes = config.num_nodes
 
         self.solver_name = solver_name
-        self.graph_mode = graph_mode
-        self.dynamics_mode = dynamics_mode
+        self.dynamics_mode = "implicit_midpoint"
 
         default_solver_options: dict[str, Any] = {
             "ipopt.print_level": 5,
@@ -292,6 +252,7 @@ class FastDualEEOCP:
             "ipopt.acceptable_tol": 1e-3,
             "ipopt.acceptable_iter": 5,
             "print_time": True,
+            "expand": True,
         }
 
         if solver_options is not None:
@@ -400,266 +361,6 @@ class FastDualEEOCP:
             U_nodes=U_nodes,
         )
 
-    def _append_explicit_hs_terms(
-        self,
-        *,
-        X: list[ca.MX],
-        U: list[ca.MX],
-        h: ca.MX,
-        p_ref: ca.MX,
-        W_ee: ca.DM,
-        W_v: ca.DM,
-        W_u: ca.DM,
-        J: ca.MX,
-        g: list[ca.MX],
-        lbg: list[float],
-        ubg: list[float],
-    ) -> tuple[ca.MX, dict[str, Any]]:
-        """
-        Append explicit Hermite-Simpson dynamics constraints and Simpson cost.
-        """
-        cfg = self.config
-        f_dyn = self.dynamics.explicit_dynamics_fn
-
-        if self.graph_mode == "naive":
-            for k in range(cfg.n_intervals):
-                xk = X[k]
-                xkp1 = X[k + 1]
-
-                uk = U[k]
-                ukp1 = U[k + 1]
-
-                fk = f_dyn(xk, uk)
-                fkp1 = f_dyn(xkp1, ukp1)
-
-                uc = 0.5 * (uk + ukp1)
-
-                xc = 0.5 * (xk + xkp1) + (h / 8.0) * (fk - fkp1)
-
-                fc = f_dyn(xc, uc)
-
-                defect = xkp1 - xk - (h / 6.0) * (
-                    fk + 4.0 * fc + fkp1
-                )
-
-                g.append(defect)
-                lbg.extend(np.zeros(self.nx).tolist())
-                ubg.extend(np.zeros(self.nx).tolist())
-
-                Lk = build_dual_ee_stage_cost(
-                    x=xk,
-                    u=uk,
-                    kinematics=self.kinematics,
-                    p_ref=p_ref,
-                    W_ee=W_ee,
-                    W_v=W_v,
-                    W_u=W_u,
-                    nq=self.nq,
-                    nv=self.nv,
-                )
-
-                Lc = build_dual_ee_stage_cost(
-                    x=xc,
-                    u=uc,
-                    kinematics=self.kinematics,
-                    p_ref=p_ref,
-                    W_ee=W_ee,
-                    W_v=W_v,
-                    W_u=W_u,
-                    nq=self.nq,
-                    nv=self.nv,
-                )
-
-                Lkp1 = build_dual_ee_stage_cost(
-                    x=xkp1,
-                    u=ukp1,
-                    kinematics=self.kinematics,
-                    p_ref=p_ref,
-                    W_ee=W_ee,
-                    W_v=W_v,
-                    W_u=W_u,
-                    nq=self.nq,
-                    nv=self.nv,
-                )
-
-                J += (h / 6.0) * (Lk + 4.0 * Lc + Lkp1)
-
-            graph_optimization = {
-                "dynamics_mode": self.dynamics_mode,
-                "graph_mode": self.graph_mode,
-                "reuse_node_dynamics": False,
-                "reuse_node_stage_cost": False,
-                "node_dynamics_calls": 0,
-                "midpoint_dynamics_calls": 0,
-                "implicit_residual_calls": 0,
-                "total_dynamics_calls": 3 * cfg.n_intervals,
-                "naive_dynamics_calls": 3 * cfg.n_intervals,
-            }
-
-            return J, graph_optimization
-
-        if self.graph_mode == "reuse_dynamics":
-            F_nodes: list[ca.MX] = []
-
-            for k in range(self.num_nodes):
-                F_nodes.append(f_dyn(X[k], U[k]))
-
-            for k in range(cfg.n_intervals):
-                xk = X[k]
-                xkp1 = X[k + 1]
-
-                uk = U[k]
-                ukp1 = U[k + 1]
-
-                fk = F_nodes[k]
-                fkp1 = F_nodes[k + 1]
-
-                uc = 0.5 * (uk + ukp1)
-
-                xc = 0.5 * (xk + xkp1) + (h / 8.0) * (fk - fkp1)
-
-                fc = f_dyn(xc, uc)
-
-                defect = xkp1 - xk - (h / 6.0) * (
-                    fk + 4.0 * fc + fkp1
-                )
-
-                g.append(defect)
-                lbg.extend(np.zeros(self.nx).tolist())
-                ubg.extend(np.zeros(self.nx).tolist())
-
-                Lk = build_dual_ee_stage_cost(
-                    x=xk,
-                    u=uk,
-                    kinematics=self.kinematics,
-                    p_ref=p_ref,
-                    W_ee=W_ee,
-                    W_v=W_v,
-                    W_u=W_u,
-                    nq=self.nq,
-                    nv=self.nv,
-                )
-
-                Lc = build_dual_ee_stage_cost(
-                    x=xc,
-                    u=uc,
-                    kinematics=self.kinematics,
-                    p_ref=p_ref,
-                    W_ee=W_ee,
-                    W_v=W_v,
-                    W_u=W_u,
-                    nq=self.nq,
-                    nv=self.nv,
-                )
-
-                Lkp1 = build_dual_ee_stage_cost(
-                    x=xkp1,
-                    u=ukp1,
-                    kinematics=self.kinematics,
-                    p_ref=p_ref,
-                    W_ee=W_ee,
-                    W_v=W_v,
-                    W_u=W_u,
-                    nq=self.nq,
-                    nv=self.nv,
-                )
-
-                J += (h / 6.0) * (Lk + 4.0 * Lc + Lkp1)
-
-            graph_optimization = {
-                "dynamics_mode": self.dynamics_mode,
-                "graph_mode": self.graph_mode,
-                "reuse_node_dynamics": True,
-                "reuse_node_stage_cost": False,
-                "node_dynamics_calls": self.num_nodes,
-                "midpoint_dynamics_calls": cfg.n_intervals,
-                "implicit_residual_calls": 0,
-                "total_dynamics_calls": self.num_nodes + cfg.n_intervals,
-                "naive_dynamics_calls": 3 * cfg.n_intervals,
-            }
-
-            return J, graph_optimization
-
-        if self.graph_mode == "reuse_dynamics_and_cost":
-            F_nodes: list[ca.MX] = []
-
-            for k in range(self.num_nodes):
-                F_nodes.append(f_dyn(X[k], U[k]))
-
-            L_nodes: list[ca.MX] = []
-
-            for k in range(self.num_nodes):
-                L_nodes.append(
-                    build_dual_ee_stage_cost(
-                        x=X[k],
-                        u=U[k],
-                        kinematics=self.kinematics,
-                        p_ref=p_ref,
-                        W_ee=W_ee,
-                        W_v=W_v,
-                        W_u=W_u,
-                        nq=self.nq,
-                        nv=self.nv,
-                    )
-                )
-
-            for k in range(cfg.n_intervals):
-                xk = X[k]
-                xkp1 = X[k + 1]
-
-                uk = U[k]
-                ukp1 = U[k + 1]
-
-                fk = F_nodes[k]
-                fkp1 = F_nodes[k + 1]
-
-                uc = 0.5 * (uk + ukp1)
-
-                xc = 0.5 * (xk + xkp1) + (h / 8.0) * (fk - fkp1)
-
-                fc = f_dyn(xc, uc)
-
-                defect = xkp1 - xk - (h / 6.0) * (
-                    fk + 4.0 * fc + fkp1
-                )
-
-                g.append(defect)
-                lbg.extend(np.zeros(self.nx).tolist())
-                ubg.extend(np.zeros(self.nx).tolist())
-
-                Lk = L_nodes[k]
-                Lkp1 = L_nodes[k + 1]
-
-                Lc = build_dual_ee_stage_cost(
-                    x=xc,
-                    u=uc,
-                    kinematics=self.kinematics,
-                    p_ref=p_ref,
-                    W_ee=W_ee,
-                    W_v=W_v,
-                    W_u=W_u,
-                    nq=self.nq,
-                    nv=self.nv,
-                )
-
-                J += (h / 6.0) * (Lk + 4.0 * Lc + Lkp1)
-
-            graph_optimization = {
-                "dynamics_mode": self.dynamics_mode,
-                "graph_mode": self.graph_mode,
-                "reuse_node_dynamics": True,
-                "reuse_node_stage_cost": True,
-                "node_dynamics_calls": self.num_nodes,
-                "midpoint_dynamics_calls": cfg.n_intervals,
-                "implicit_residual_calls": 0,
-                "total_dynamics_calls": self.num_nodes + cfg.n_intervals,
-                "naive_dynamics_calls": 3 * cfg.n_intervals,
-            }
-
-            return J, graph_optimization
-
-        raise RuntimeError(f"Unhandled graph_mode: {self.graph_mode!r}")
-
     def _append_implicit_midpoint_terms(
         self,
         *,
@@ -684,12 +385,6 @@ class FastDualEEOCP:
             xdot_mid = (x_{k+1} - x_k) / h
 
             implicit_dynamics_fn(x_mid, xdot_mid, u_mid) = 0
-
-        This residual is:
-            [
-                qdot_mid - v_mid
-                RNEA(q_mid, v_mid, vdot_mid) - u_mid
-            ]
         """
         cfg = self.config
         f_impl = self.dynamics.implicit_dynamics_fn
@@ -727,15 +422,10 @@ class FastDualEEOCP:
             J += h * L_mid
 
         graph_optimization = {
-            "dynamics_mode": self.dynamics_mode,
-            "graph_mode": "not_used",
-            "reuse_node_dynamics": False,
-            "reuse_node_stage_cost": False,
-            "node_dynamics_calls": 0,
-            "midpoint_dynamics_calls": 0,
+            "dynamics_mode": "implicit_midpoint",
             "implicit_residual_calls": cfg.n_intervals,
             "total_dynamics_calls": cfg.n_intervals,
-            "naive_dynamics_calls": 3 * cfg.n_intervals,
+            "naive_explicit_hs_dynamics_calls": 3 * cfg.n_intervals,
         }
 
         return J, graph_optimization
@@ -790,7 +480,7 @@ class FastDualEEOCP:
 
         # ---------------------------------------------------------------------
         # Parameter:
-        #   P = p_ref = [p_left_ref; p_right_ref] ∈ R6
+        #   P = p_ref = [p_left_ref; p_right_ref] in R6
         # ---------------------------------------------------------------------
         P = ca.MX.sym("P", 6)
         p_ref = P
@@ -853,7 +543,7 @@ class FastDualEEOCP:
             X.append(Xk)
             w.append(Xk)
 
-            # X0 is NOT fixed here.
+            # X0 is not fixed here.
             # It will be fixed in solve_stage(...) by setting:
             #   lbx[X0_slice] = x0_stage
             #   ubx[X0_slice] = x0_stage
@@ -886,44 +576,21 @@ class FastDualEEOCP:
             current_index += self.nu
 
         # ---------------------------------------------------------------------
-        # Dynamics constraints + stage cost
+        # Implicit midpoint dynamics constraints + midpoint stage cost
         # ---------------------------------------------------------------------
-        if self.dynamics_mode == "explicit_hs":
-            J, graph_optimization = self._append_explicit_hs_terms(
-                X=X,
-                U=U,
-                h=h,
-                p_ref=p_ref,
-                W_ee=W_ee,
-                W_v=W_v,
-                W_u=W_u,
-                J=J,
-                g=g,
-                lbg=lbg,
-                ubg=ubg,
-            )
-
-            method = "explicit_hermite_simpson"
-
-        elif self.dynamics_mode == "implicit_midpoint":
-            J, graph_optimization = self._append_implicit_midpoint_terms(
-                X=X,
-                U=U,
-                h=h,
-                p_ref=p_ref,
-                W_ee=W_ee,
-                W_v=W_v,
-                W_u=W_u,
-                J=J,
-                g=g,
-                lbg=lbg,
-                ubg=ubg,
-            )
-
-            method = "implicit_midpoint"
-
-        else:
-            raise RuntimeError(f"Unhandled dynamics_mode: {self.dynamics_mode!r}")
+        J, graph_optimization = self._append_implicit_midpoint_terms(
+            X=X,
+            U=U,
+            h=h,
+            p_ref=p_ref,
+            W_ee=W_ee,
+            W_v=W_v,
+            W_u=W_u,
+            J=J,
+            g=g,
+            lbg=lbg,
+            ubg=ubg,
+        )
 
         # ---------------------------------------------------------------------
         # Terminal cost
@@ -965,9 +632,8 @@ class FastDualEEOCP:
             "nv": self.nv,
             "nu": self.nu,
             "nx": self.nx,
-            "method": method,
-            "dynamics_mode": self.dynamics_mode,
-            "graph_mode": self.graph_mode,
+            "method": "implicit_midpoint",
+            "dynamics_mode": "implicit_midpoint",
             "collision_enabled": False,
             "parameter_dim": 6,
             "tf_min": float(cfg.tf_min),
@@ -1090,7 +756,7 @@ class FastDualEEOCP:
         """
         Solve one OCP stage.
 
-        This does NOT rebuild the solver.
+        This does not rebuild the solver.
 
         Per-stage inputs:
             x0_value:
@@ -1194,13 +860,11 @@ class FastDualEEOCP:
         Print compact OCP summary.
         """
         print("===== FAST MULTI-STAGE DUAL-EE OCP =====")
-        print(f"method              : {self.dynamics_mode}")
+        print("method              : implicit midpoint")
         print("collision_enabled   : False")
         print("build_once          : True")
-        print("parameter           : p_ref ∈ R6")
+        print("parameter           : p_ref in R6")
         print("X0 handling         : fixed by lbx/ubx per stage")
-        print(f"dynamics_mode       : {self.dynamics_mode}")
-        print(f"graph_mode          : {self.graph_mode}")
         print(f"N                   : {self.N}")
         print(f"num_nodes           : {self.num_nodes}")
         print(f"nq                  : {self.nq}")
@@ -1227,18 +891,6 @@ class FastDualEEOCP:
                     f"{graph_opt['dynamics_mode']}"
                 )
                 print(
-                    "  graph_mode             : "
-                    f"{graph_opt['graph_mode']}"
-                )
-                print(
-                    "  reuse_node_dynamics    : "
-                    f"{graph_opt['reuse_node_dynamics']}"
-                )
-                print(
-                    "  reuse_node_stage_cost  : "
-                    f"{graph_opt['reuse_node_stage_cost']}"
-                )
-                print(
                     "  implicit_residual_calls: "
                     f"{graph_opt['implicit_residual_calls']}"
                 )
@@ -1247,8 +899,8 @@ class FastDualEEOCP:
                     f"{graph_opt['total_dynamics_calls']}"
                 )
                 print(
-                    "  naive_dynamics_calls   : "
-                    f"{graph_opt['naive_dynamics_calls']}"
+                    "  naive_explicit_hs_calls: "
+                    f"{graph_opt['naive_explicit_hs_dynamics_calls']}"
                 )
 
         if self.solution is not None:
