@@ -31,6 +31,50 @@ class BoundDiagnostics:
 
 
 @dataclass(frozen=True)
+class ImplicitMidpointResidualDiagnostics:
+    """
+    Diagnostics for implicit midpoint dynamics residual.
+
+    For each interval k:
+
+        x_mid    = 0.5 * (X_k + X_{k+1})
+        u_mid    = 0.5 * (U_k + U_{k+1})
+        xdot_mid = (X_{k+1} - X_k) / h
+
+        residual_k = F_impl(x_mid, xdot_mid, u_mid)
+
+    where:
+
+        F_impl =
+        [
+            qdot_mid - v_mid
+            RNEA(q_mid, v_mid, vdot_mid) - u_mid
+        ]
+
+    residual:
+        Full implicit dynamics residual, shape (N, nx).
+
+    kinematic:
+        qdot_mid - v_mid, shape (N, nq).
+
+    inverse_dynamics:
+        RNEA(...) - u_mid, shape (N, nv).
+    """
+
+    max_residual_l2: float
+    mean_residual_l2: float
+    max_residual_inf: float
+
+    max_kinematic_l2: float
+    mean_kinematic_l2: float
+    max_kinematic_inf: float
+
+    max_inverse_dynamics_l2: float
+    mean_inverse_dynamics_l2: float
+    max_inverse_dynamics_inf: float
+
+
+@dataclass(frozen=True)
 class OCPDiagnosticsReport:
     """
     Diagnostics report for one solved OCP stage.
@@ -43,6 +87,7 @@ class OCPDiagnosticsReport:
     tf: float
     h: float
     num_nodes: int
+    method: str
 
     initial_state_l2_error: float
     initial_state_inf_error: float
@@ -60,9 +105,7 @@ class OCPDiagnosticsReport:
     terminal_right_error_norm: float
     terminal_pair_error_norm: float
 
-    max_defect_l2: float
-    mean_defect_l2: float
-    max_defect_inf: float
+    implicit_midpoint_residual: ImplicitMidpointResidualDiagnostics
 
     q_bounds: BoundDiagnostics
     v_bounds: BoundDiagnostics
@@ -135,7 +178,7 @@ def _bound_diagnostics(
     )
 
 
-def compute_hermite_simpson_defects(
+def compute_implicit_midpoint_residuals(
     *,
     dynamics: Any,
     X_nodes: np.ndarray,
@@ -143,21 +186,19 @@ def compute_hermite_simpson_defects(
     h: float,
 ) -> np.ndarray:
     """
-    Compute numeric Hermite-Simpson defects for a solved trajectory.
+    Compute numeric implicit midpoint residuals for a solved trajectory.
 
-    The OCP uses explicit dynamics:
+    For each interval k:
 
-        xdot = f(x, u)
+        x_mid    = 0.5 * (X_k + X_{k+1})
+        u_mid    = 0.5 * (U_k + U_{k+1})
+        xdot_mid = (X_{k+1} - X_k) / h
 
-    and Hermite-Simpson defect:
-
-        defect_k =
-            x_{k+1} - x_k
-            - h/6 * (f_k + 4 f_c + f_{k+1})
+        residual_k = implicit_dynamics(x_mid, xdot_mid, u_mid)
 
     Returns
     -------
-    defects:
+    residuals:
         shape = (N, nx)
     """
     X = np.asarray(X_nodes, dtype=float)
@@ -181,7 +222,7 @@ def compute_hermite_simpson_defects(
     num_nodes, nx = X.shape
     num_intervals = num_nodes - 1
 
-    defects = np.zeros((num_intervals, nx), dtype=float)
+    residuals = np.zeros((num_intervals, nx), dtype=float)
 
     for k in range(num_intervals):
         xk = X[k]
@@ -190,18 +231,69 @@ def compute_hermite_simpson_defects(
         uk = U[k]
         ukp1 = U[k + 1]
 
-        fk = dynamics.evaluate_explicit_dynamics(xk, uk)
-        fkp1 = dynamics.evaluate_explicit_dynamics(xkp1, ukp1)
+        x_mid = 0.5 * (xk + xkp1)
+        u_mid = 0.5 * (uk + ukp1)
 
-        uc = 0.5 * (uk + ukp1)
+        xdot_mid = (xkp1 - xk) / h
 
-        xc = 0.5 * (xk + xkp1) + (h / 8.0) * (fk - fkp1)
+        residuals[k] = dynamics.evaluate_implicit_dynamics(
+            x_mid,
+            xdot_mid,
+            u_mid,
+        )
 
-        fc = dynamics.evaluate_explicit_dynamics(xc, uc)
+    return residuals
 
-        defects[k] = xkp1 - xk - (h / 6.0) * (fk + 4.0 * fc + fkp1)
 
-    return defects
+def _implicit_midpoint_residual_diagnostics(
+    *,
+    residuals: np.ndarray,
+    nq: int,
+    nv: int,
+) -> ImplicitMidpointResidualDiagnostics:
+    """
+    Build compact diagnostics from implicit midpoint residuals.
+
+    residuals:
+        shape = (N, nq + nv)
+
+    first nq entries:
+        qdot_mid - v_mid
+
+    next nv entries:
+        RNEA(q_mid, v_mid, vdot_mid) - u_mid
+    """
+    residuals = np.asarray(residuals, dtype=float)
+
+    if residuals.ndim != 2:
+        raise ValueError(f"residuals must be 2D, got shape {residuals.shape}")
+
+    if residuals.shape[1] != nq + nv:
+        raise ValueError(
+            f"residual dim mismatch: expected {nq + nv}, "
+            f"got {residuals.shape[1]}"
+        )
+
+    kin_res = residuals[:, :nq]
+    dyn_res = residuals[:, nq : nq + nv]
+
+    residual_l2 = np.linalg.norm(residuals, axis=1)
+    kin_l2 = np.linalg.norm(kin_res, axis=1)
+    dyn_l2 = np.linalg.norm(dyn_res, axis=1)
+
+    return ImplicitMidpointResidualDiagnostics(
+        max_residual_l2=float(np.max(residual_l2)),
+        mean_residual_l2=float(np.mean(residual_l2)),
+        max_residual_inf=float(np.max(np.abs(residuals))),
+
+        max_kinematic_l2=float(np.max(kin_l2)),
+        mean_kinematic_l2=float(np.mean(kin_l2)),
+        max_kinematic_inf=float(np.max(np.abs(kin_res))),
+
+        max_inverse_dynamics_l2=float(np.max(dyn_l2)),
+        mean_inverse_dynamics_l2=float(np.mean(dyn_l2)),
+        max_inverse_dynamics_inf=float(np.max(np.abs(dyn_res))),
+    )
 
 
 def evaluate_ocp_solution(
@@ -212,6 +304,8 @@ def evaluate_ocp_solution(
 ) -> OCPDiagnosticsReport:
     """
     Evaluate one solved OCP stage.
+
+    This diagnostics module assumes the OCP uses implicit midpoint dynamics.
 
     Parameters
     ----------
@@ -236,6 +330,14 @@ def evaluate_ocp_solution(
         raise RuntimeError("ocp.problem_data is None. Build the OCP first.")
 
     pd = ocp.problem_data
+
+    method = str(pd.get("method", "unknown"))
+
+    if method != "implicit_midpoint":
+        raise ValueError(
+            "This diagnostics file expects method='implicit_midpoint'. "
+            f"Got method={method!r}."
+        )
 
     X_nodes = np.asarray(solution.X_nodes, dtype=float)
     U_nodes = np.asarray(solution.U_nodes, dtype=float)
@@ -281,18 +383,18 @@ def evaluate_ocp_solution(
         )
     )
 
-    defects = compute_hermite_simpson_defects(
+    residuals = compute_implicit_midpoint_residuals(
         dynamics=ocp.dynamics,
         X_nodes=X_nodes,
         U_nodes=U_nodes,
         h=solution.h,
     )
 
-    defect_l2 = np.linalg.norm(defects, axis=1)
-
-    max_defect_l2 = float(np.max(defect_l2))
-    mean_defect_l2 = float(np.mean(defect_l2))
-    max_defect_inf = float(np.max(np.abs(defects)))
+    residual_report = _implicit_midpoint_residual_diagnostics(
+        residuals=residuals,
+        nq=ocp.nq,
+        nv=ocp.nv,
+    )
 
     x_min = np.asarray(pd["x_min"], dtype=float)
     x_max = np.asarray(pd["x_max"], dtype=float)
@@ -334,6 +436,7 @@ def evaluate_ocp_solution(
         tf=float(solution.tf),
         h=float(solution.h),
         num_nodes=int(X_nodes.shape[0]),
+        method=method,
         initial_state_l2_error=initial_state_l2_error,
         initial_state_inf_error=initial_state_inf_error,
         terminal_left_position=terminal_left_position,
@@ -345,9 +448,7 @@ def evaluate_ocp_solution(
         terminal_left_error_norm=terminal_left_error_norm,
         terminal_right_error_norm=terminal_right_error_norm,
         terminal_pair_error_norm=terminal_pair_error_norm,
-        max_defect_l2=max_defect_l2,
-        mean_defect_l2=mean_defect_l2,
-        max_defect_inf=max_defect_inf,
+        implicit_midpoint_residual=residual_report,
         q_bounds=q_bounds,
         v_bounds=v_bounds,
         u_bounds=u_bounds,
@@ -365,6 +466,7 @@ def print_ocp_diagnostics(report: OCPDiagnosticsReport) -> None:
     print(f"success                  : {report.success}")
     print(f"status                   : {report.status}")
     print(f"objective                : {report.objective:.6e}")
+    print(f"method                   : {report.method}")
     print(f"Tf                       : {report.tf:.6f}")
     print(f"h                        : {report.h:.6f}")
     print(f"num_nodes                : {report.num_nodes}")
@@ -388,11 +490,25 @@ def print_ocp_diagnostics(report: OCPDiagnosticsReport) -> None:
 
     print(f"pair error norm          : {report.terminal_pair_error_norm:.6e}")
 
+    residual = report.implicit_midpoint_residual
+
     print("")
-    print("[Hermite-Simpson defect]")
-    print(f"max defect L2            : {report.max_defect_l2:.6e}")
-    print(f"mean defect L2           : {report.mean_defect_l2:.6e}")
-    print(f"max defect inf           : {report.max_defect_inf:.6e}")
+    print("[implicit midpoint residual]")
+    print(f"max residual L2          : {residual.max_residual_l2:.6e}")
+    print(f"mean residual L2         : {residual.mean_residual_l2:.6e}")
+    print(f"max residual inf         : {residual.max_residual_inf:.6e}")
+
+    print("")
+    print("[kinematic residual: qdot - v]")
+    print(f"max kinematic L2         : {residual.max_kinematic_l2:.6e}")
+    print(f"mean kinematic L2        : {residual.mean_kinematic_l2:.6e}")
+    print(f"max kinematic inf        : {residual.max_kinematic_inf:.6e}")
+
+    print("")
+    print("[inverse dynamics residual: RNEA - u]")
+    print(f"max inverse dyn L2       : {residual.max_inverse_dynamics_l2:.6e}")
+    print(f"mean inverse dyn L2      : {residual.mean_inverse_dynamics_l2:.6e}")
+    print(f"max inverse dyn inf      : {residual.max_inverse_dynamics_inf:.6e}")
 
     print("")
     print("[bounds]")
