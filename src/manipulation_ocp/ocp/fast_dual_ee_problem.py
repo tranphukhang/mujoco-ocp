@@ -246,10 +246,10 @@ class FastDualEEOCP:
 
         default_solver_options: dict[str, Any] = {
             "ipopt.print_level": 5,
-            "ipopt.max_iter": 300,
+            "ipopt.max_iter": 100,
             "ipopt.tol": 1e-4,
             "ipopt.acceptable_tol": 1e-3,
-            "ipopt.acceptable_iter": 10,
+            "ipopt.acceptable_iter": 5,
             "print_time": True,
         }
 

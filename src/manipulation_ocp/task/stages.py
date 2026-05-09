@@ -218,7 +218,8 @@ class StageResult:
     Result for one ParallelArmStep.
 
     This is intentionally generic so planner and MuJoCo executor can attach
-    OCP solution, gripper trajectories, or joint-space return trajectories.
+    OCP solution, resampled OCP reference, gripper trajectories, or joint-space
+    return trajectories.
     """
 
     step_name: str
@@ -228,11 +229,21 @@ class StageResult:
     x_start: np.ndarray
     x_end: np.ndarray
 
+    # Raw OCP solution.
     ocp_solution: Any | None = None
 
+    # OCP trajectory resampled to planner dt, usually dt = 0.02.
+    # These are the references that should be passed to RL / MuJoCo executor.
+    ocp_time_ref: np.ndarray | None = None
+    ocp_q_ref: np.ndarray | None = None
+    ocp_v_ref: np.ndarray | None = None
+    ocp_u_ref: np.ndarray | None = None
+
+    # Smooth normalized gripper command trajectories.
     left_gripper_command_traj: np.ndarray | None = None
     right_gripper_command_traj: np.ndarray | None = None
 
+    # Joint-space return trajectory for ReturnArmAction.
     q_return_traj: np.ndarray | None = None
     v_return_traj: np.ndarray | None = None
 

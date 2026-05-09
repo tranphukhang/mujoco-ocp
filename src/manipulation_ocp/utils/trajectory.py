@@ -234,3 +234,252 @@ def build_gripper_command_trajectory(
     command_traj = c0 + alpha * (c1 - c0)
 
     return np.clip(command_traj, 0.0, 1.0)
+
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ResampledTrajectory:
+    """
+    Trajectory resampled to a fixed dt grid.
+
+    time:
+        Shape (num_nodes,)
+
+    q:
+        Shape (num_nodes, nq)
+
+    v:
+        Shape (num_nodes, nv)
+
+    u:
+        Optional, shape (num_nodes, nu)
+    """
+
+    time: np.ndarray
+    q: np.ndarray
+    v: np.ndarray
+    u: np.ndarray | None
+
+    dt: float
+    original_tf: float
+    resampled_tf: float
+
+
+def build_fixed_dt_grid_from_tf(
+    *,
+    tf: float,
+    dt: float,
+    close_to_integer_tol: float = 1e-2,
+) -> np.ndarray:
+    """
+    Build a fixed-dt time grid that does not exceed tf significantly.
+
+    This is useful when OCP returns tf slightly different from an exact
+    multiple of dt, for example:
+        tf = 0.400032
+        dt = 0.02
+
+    In that case this returns:
+        [0.00, 0.02, ..., 0.40]
+
+    Parameters
+    ----------
+    tf:
+        Original trajectory duration.
+
+    dt:
+        Desired fixed sampling time.
+
+    close_to_integer_tol:
+        Tolerance on tf / dt for snapping to the nearest integer number
+        of intervals.
+    """
+    tf = float(tf)
+    dt = float(dt)
+
+    if tf <= 0.0:
+        raise ValueError(f"tf must be > 0, got {tf}")
+
+    if dt <= 0.0:
+        raise ValueError(f"dt must be > 0, got {dt}")
+
+    ratio = tf / dt
+    nearest_intervals = int(round(ratio))
+
+    if nearest_intervals <= 0:
+        nearest_intervals = 1
+
+    if abs(ratio - nearest_intervals) <= close_to_integer_tol:
+        num_intervals = nearest_intervals
+    else:
+        # Avoid extrapolating beyond the OCP trajectory duration.
+        num_intervals = int(np.floor(ratio))
+        num_intervals = max(num_intervals, 1)
+
+    return np.arange(num_intervals + 1, dtype=float) * dt
+
+
+def interpolate_vector_trajectory(
+    *,
+    values: np.ndarray,
+    source_time: np.ndarray,
+    target_time: np.ndarray,
+    name: str = "values",
+) -> np.ndarray:
+    """
+    Linearly interpolate a vector trajectory.
+
+    values:
+        shape = (num_source_nodes, dim)
+
+    source_time:
+        shape = (num_source_nodes,)
+
+    target_time:
+        shape = (num_target_nodes,)
+    """
+    values_arr = np.asarray(values, dtype=float)
+    source_time_arr = np.asarray(source_time, dtype=float).reshape(-1)
+    target_time_arr = np.asarray(target_time, dtype=float).reshape(-1)
+
+    if values_arr.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got shape {values_arr.shape}")
+
+    if values_arr.shape[0] != source_time_arr.size:
+        raise ValueError(
+            f"{name} rows must match source_time size. "
+            f"Got {values_arr.shape[0]} and {source_time_arr.size}"
+        )
+
+    if source_time_arr[0] != 0.0:
+        raise ValueError("source_time must start at 0.0")
+
+    if np.any(np.diff(source_time_arr) <= 0.0):
+        raise ValueError("source_time must be strictly increasing")
+
+    if target_time_arr[0] != 0.0:
+        raise ValueError("target_time must start at 0.0")
+
+    if np.any(np.diff(target_time_arr) <= 0.0):
+        raise ValueError("target_time must be strictly increasing")
+
+    if target_time_arr[-1] > source_time_arr[-1] + 1e-9:
+        raise ValueError(
+            "target_time exceeds source_time duration. "
+            f"target end={target_time_arr[-1]}, source end={source_time_arr[-1]}"
+        )
+
+    out = np.zeros((target_time_arr.size, values_arr.shape[1]), dtype=float)
+
+    for j in range(values_arr.shape[1]):
+        out[:, j] = np.interp(
+            target_time_arr,
+            source_time_arr,
+            values_arr[:, j],
+        )
+
+    return out
+
+
+def resample_qv_trajectory_to_dt(
+    *,
+    q_nodes: np.ndarray,
+    v_nodes: np.ndarray,
+    tf: float,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Resample q and v trajectories to a fixed dt grid.
+
+    Returns
+    -------
+    time:
+        Shape (num_resampled_nodes,)
+
+    q_ref:
+        Shape (num_resampled_nodes, nq)
+
+    v_ref:
+        Shape (num_resampled_nodes, nv)
+    """
+    q_arr = np.asarray(q_nodes, dtype=float)
+    v_arr = np.asarray(v_nodes, dtype=float)
+
+    if q_arr.ndim != 2:
+        raise ValueError(f"q_nodes must be 2D, got shape {q_arr.shape}")
+
+    if v_arr.ndim != 2:
+        raise ValueError(f"v_nodes must be 2D, got shape {v_arr.shape}")
+
+    if q_arr.shape != v_arr.shape:
+        raise ValueError(
+            f"q_nodes and v_nodes must have same shape. "
+            f"Got {q_arr.shape} and {v_arr.shape}"
+        )
+
+    source_time = np.linspace(0.0, float(tf), q_arr.shape[0])
+    target_time = build_fixed_dt_grid_from_tf(tf=tf, dt=dt)
+
+    q_ref = interpolate_vector_trajectory(
+        values=q_arr,
+        source_time=source_time,
+        target_time=target_time,
+        name="q_nodes",
+    )
+
+    v_ref = interpolate_vector_trajectory(
+        values=v_arr,
+        source_time=source_time,
+        target_time=target_time,
+        name="v_nodes",
+    )
+
+    return target_time, q_ref, v_ref
+
+
+def resample_ocp_solution_to_dt(
+    *,
+    solution,
+    dt: float,
+    include_u: bool = True,
+) -> ResampledTrajectory:
+    """
+    Resample an OCP solution to a fixed dt grid.
+
+    This is the function planner/executor should call before passing
+    reference trajectory to RL or MuJoCo executor.
+    """
+    time, q_ref, v_ref = resample_qv_trajectory_to_dt(
+        q_nodes=solution.q_nodes,
+        v_nodes=solution.v_nodes,
+        tf=solution.tf,
+        dt=dt,
+    )
+
+    u_ref = None
+
+    if include_u:
+        source_time = np.linspace(
+            0.0,
+            float(solution.tf),
+            solution.U_nodes.shape[0],
+        )
+
+        u_ref = interpolate_vector_trajectory(
+            values=solution.U_nodes,
+            source_time=source_time,
+            target_time=time,
+            name="U_nodes",
+        )
+
+    return ResampledTrajectory(
+        time=time,
+        q=q_ref,
+        v=v_ref,
+        u=u_ref,
+        dt=float(dt),
+        original_tf=float(solution.tf),
+        resampled_tf=float(time[-1]),
+    )
