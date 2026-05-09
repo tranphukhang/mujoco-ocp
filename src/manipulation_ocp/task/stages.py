@@ -11,19 +11,96 @@ HoldMode: TypeAlias = Literal["current", "home"]
 
 
 def _validate_side(side: str) -> ArmSide:
+    """
+    Validate arm side.
+    """
     if side not in ("left", "right"):
         raise ValueError(f"side must be 'left' or 'right', got {side!r}")
 
     return side  # type: ignore[return-value]
 
 
-def _as_vec3(value: Sequence[float] | np.ndarray, *, name: str) -> np.ndarray:
+def _validate_hold_mode(mode: str) -> HoldMode:
+    """
+    Validate hold mode.
+    """
+    if mode not in ("current", "home"):
+        raise ValueError(
+            f"HoldAction.mode must be 'current' or 'home', got {mode!r}"
+        )
+
+    return mode  # type: ignore[return-value]
+
+
+def _as_vec3(
+    value: Sequence[float] | np.ndarray,
+    *,
+    name: str,
+) -> np.ndarray:
+    """
+    Convert value to a finite 3D vector.
+    """
     arr = np.asarray(value, dtype=float).reshape(-1)
 
     if arr.size != 3:
         raise ValueError(f"{name} must have size 3, got shape {arr.shape}")
 
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain finite values, got {arr}")
+
     return arr
+
+
+def _validate_finite_scalar(
+    value: float,
+    *,
+    name: str,
+) -> float:
+    """
+    Validate scalar is finite and return it as float.
+    """
+    value_float = float(value)
+
+    if not np.isfinite(value_float):
+        raise ValueError(f"{name} must be finite, got {value}")
+
+    return value_float
+
+
+def _validate_positive_duration(
+    duration: float,
+    *,
+    name: str,
+) -> float:
+    """
+    Validate duration is finite and strictly positive.
+    """
+    duration_float = _validate_finite_scalar(duration, name=name)
+
+    if duration_float <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {duration_float}")
+
+    return duration_float
+
+
+def _validate_gripper_command(
+    command: float,
+    *,
+    name: str,
+) -> float:
+    """
+    Validate normalized gripper command.
+
+    Convention:
+        0.0 = open
+        1.0 = close
+    """
+    command_float = _validate_finite_scalar(command, name=name)
+
+    if command_float < 0.0 or command_float > 1.0:
+        raise ValueError(f"{name} must be in [0, 1], got {command_float}")
+
+    return command_float
 
 
 @dataclass(frozen=True)
@@ -33,11 +110,12 @@ class HoldAction:
 
     mode:
         "current":
-            Keep current EE target.
+            Keep the current end-effector target.
 
         "home":
-            Use the arm home EE position as target.
-            Useful at the first step when right arm should stay home.
+            Use the arm home end-effector position as target.
+            This is useful at the first stage when one arm should stay home
+            while the other arm starts moving.
     """
 
     side: ArmSide
@@ -45,11 +123,7 @@ class HoldAction:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "side", _validate_side(self.side))
-
-        if self.mode not in ("current", "home"):
-            raise ValueError(
-                f"HoldAction.mode must be 'current' or 'home', got {self.mode!r}"
-            )
+        object.__setattr__(self, "mode", _validate_hold_mode(self.mode))
 
 
 @dataclass(frozen=True)
@@ -58,11 +132,12 @@ class ReachAction:
     Move one end-effector to a target position.
 
     target:
-        EE target position in the Pinocchio pelvis/base frame.
+        End-effector target position in the Pinocchio pelvis/base frame.
+        Shape: (3,)
     """
 
     side: ArmSide
-    target: np.ndarray
+    target: Sequence[float] | np.ndarray
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "side", _validate_side(self.side))
@@ -78,7 +153,7 @@ class LiftAction:
     """
     Lift one end-effector after grasping.
 
-    Exactly one of dz or z_threshold should be provided.
+    Exactly one of dz or z_threshold must be provided.
 
     dz:
         Relative lifting distance along +z in pelvis/base frame.
@@ -102,13 +177,20 @@ class LiftAction:
                 "LiftAction requires exactly one of dz or z_threshold."
             )
 
-        if self.dz is not None and self.dz <= 0.0:
-            raise ValueError(f"LiftAction.dz must be > 0, got {self.dz}")
+        if self.dz is not None:
+            dz = _validate_finite_scalar(self.dz, name="LiftAction.dz")
 
-        if self.z_threshold is not None and not np.isfinite(self.z_threshold):
-            raise ValueError(
-                f"LiftAction.z_threshold must be finite, got {self.z_threshold}"
+            if dz <= 0.0:
+                raise ValueError(f"LiftAction.dz must be > 0, got {dz}")
+
+            object.__setattr__(self, "dz", dz)
+
+        if self.z_threshold is not None:
+            z_threshold = _validate_finite_scalar(
+                self.z_threshold,
+                name="LiftAction.z_threshold",
             )
+            object.__setattr__(self, "z_threshold", z_threshold)
 
 
 @dataclass(frozen=True)
@@ -130,16 +212,22 @@ class GripperAction:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "side", _validate_side(self.side))
-
-        if self.command < 0.0 or self.command > 1.0:
-            raise ValueError(
-                f"GripperAction.command must be in [0, 1], got {self.command}"
-            )
-
-        if self.duration <= 0.0:
-            raise ValueError(
-                f"GripperAction.duration must be > 0, got {self.duration}"
-            )
+        object.__setattr__(
+            self,
+            "command",
+            _validate_gripper_command(
+                self.command,
+                name="GripperAction.command",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "duration",
+            _validate_positive_duration(
+                self.duration,
+                name="GripperAction.duration",
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -150,9 +238,9 @@ class ReturnArmAction:
     This action does not use OCP. It should be executed with a simple
     joint-space trajectory generator.
 
-    side:
-        "left"  -> return q[3:10]
-        "right" -> return q[10:17]
+    Joint convention:
+        left arm  -> q[3:10]
+        right arm -> q[10:17]
     """
 
     side: ArmSide
@@ -160,11 +248,14 @@ class ReturnArmAction:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "side", _validate_side(self.side))
-
-        if self.duration <= 0.0:
-            raise ValueError(
-                f"ReturnArmAction.duration must be > 0, got {self.duration}"
-            )
+        object.__setattr__(
+            self,
+            "duration",
+            _validate_positive_duration(
+                self.duration,
+                name="ReturnArmAction.duration",
+            ),
+        )
 
 
 ArmAction: TypeAlias = (
@@ -181,16 +272,25 @@ class ParallelArmStep:
     """
     One task-level step containing one action for each arm.
 
-    This is used to represent staggered left/right arm behavior.
+    This represents staggered left/right arm behavior.
 
     Example:
         step 0:
             left  = ReachAction(...)
-            right = HoldAction(mode="home")
+            right = HoldAction(side="right", mode="home")
 
         step 1:
             left  = LiftAction(...)
             right = ReachAction(...)
+
+        step 2:
+            left  = GripperAction(...)
+            right = LiftAction(...)
+
+    Important:
+        A step has exactly one action for the left arm and one action for the
+        right arm. If an action should happen later, represent it as another
+        ParallelArmStep instead of mixing temporal order inside one step.
     """
 
     name: str
@@ -198,17 +298,26 @@ class ParallelArmStep:
     right: ArmAction
 
     def __post_init__(self) -> None:
-        if not self.name:
+        if not isinstance(self.name, str):
+            raise TypeError(
+                f"ParallelArmStep.name must be a string, got {type(self.name)}"
+            )
+
+        if not self.name.strip():
             raise ValueError("ParallelArmStep.name must be non-empty")
+
+        object.__setattr__(self, "name", self.name.strip())
 
         if self.left.side != "left":
             raise ValueError(
-                f"ParallelArmStep.left must have side='left', got {self.left.side!r}"
+                "ParallelArmStep.left must have side='left', "
+                f"got {self.left.side!r}"
             )
 
         if self.right.side != "right":
             raise ValueError(
-                f"ParallelArmStep.right must have side='right', got {self.right.side!r}"
+                "ParallelArmStep.right must have side='right', "
+                f"got {self.right.side!r}"
             )
 
 
@@ -217,9 +326,11 @@ class StageResult:
     """
     Result for one ParallelArmStep.
 
-    This is intentionally generic so planner and MuJoCo executor can attach
-    OCP solution, resampled OCP reference, gripper trajectories, or joint-space
-    return trajectories.
+    This is intentionally generic so planner and MuJoCo executor can attach:
+        - raw OCP solution
+        - resampled OCP reference
+        - smooth gripper command trajectories
+        - joint-space return trajectories
     """
 
     step_name: str
@@ -247,6 +358,34 @@ class StageResult:
     q_return_traj: np.ndarray | None = None
     v_return_traj: np.ndarray | None = None
 
+    @property
+    def has_ocp_reference(self) -> bool:
+        """
+        True if this stage contains a resampled OCP reference.
+        """
+        return (
+            self.ocp_time_ref is not None
+            and self.ocp_q_ref is not None
+            and self.ocp_v_ref is not None
+        )
+
+    @property
+    def has_gripper_command(self) -> bool:
+        """
+        True if this stage contains any gripper command trajectory.
+        """
+        return (
+            self.left_gripper_command_traj is not None
+            or self.right_gripper_command_traj is not None
+        )
+
+    @property
+    def has_return_trajectory(self) -> bool:
+        """
+        True if this stage contains a return-arm joint trajectory.
+        """
+        return self.q_return_traj is not None and self.v_return_traj is not None
+
 
 @dataclass(frozen=True)
 class TaskPlanResult:
@@ -260,3 +399,23 @@ class TaskPlanResult:
     @property
     def num_stages(self) -> int:
         return len(self.stage_results)
+
+    @property
+    def successful_ocp_stages(self) -> int:
+        """
+        Count stages with successful OCP solutions.
+        """
+        count = 0
+
+        for stage in self.stage_results:
+            if stage.ocp_solution is not None and stage.ocp_solution.success:
+                count += 1
+
+        return count
+
+    @property
+    def num_ocp_stages(self) -> int:
+        """
+        Count stages that contain an OCP solution.
+        """
+        return sum(stage.ocp_solution is not None for stage in self.stage_results)
