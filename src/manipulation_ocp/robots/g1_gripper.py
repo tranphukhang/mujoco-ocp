@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Mapping
 
 import mujoco
+import pinocchio as pin
 
 from manipulation_ocp.mujoco.info import (
     get_actuator_names,
@@ -20,14 +21,16 @@ from manipulation_ocp.utils.paths import (
 # =============================================================================
 # Robot assets
 # =============================================================================
-# Pinocchio backend:
-#   - uses upper-body fixed-base G1 model
-#   - 17 DoF: waist + two arms
+# Pinocchio/OCP backend:
+#   - g1_fixed_base.xml
+#   - 17 DoF: waist + left arm + right arm
 #   - used for FK, Jacobian, IK, dynamics, OCP
 #
 # MuJoCo replay backend:
-#   - uses G1 + Robotiq grippers model
-#   - used for viewer/replay and checking gripper open/close behavior
+#   - G1_with_gripper.xml
+#   - 29 qpos: 17 G1 joints + 12 Robotiq internal joints
+#   - 19 actuators: 17 G1 position actuators + 2 gripper actuators
+#   - used only for viewer/replay/checking gripper behavior
 
 PINOCCHIO_MODEL_XML: Path = G1_FIXED_BASE_XML
 MUJOCO_REPLAY_XML: Path = G1_GRIPPER_XML
@@ -77,12 +80,8 @@ ACTIVE_G1_JOINT_NAMES: tuple[str, ...] = (
 # =============================================================================
 # Pinocchio model names
 # =============================================================================
-# The Pinocchio model is built from g1_fixed_base.xml after removing leg joints.
-# It contains exactly these 17 joints.
-#
-# Note:
-#   Pinocchio also has the "universe" joint internally, but it is not part of
-#   the actuated generalized coordinates.
+# The Pinocchio model contains exactly these 17 generalized coordinates.
+# Pinocchio also has the internal "universe" joint, but it is not part of q.
 
 PINOCCHIO_JOINT_NAMES: tuple[str, ...] = ACTIVE_G1_JOINT_NAMES
 
@@ -101,14 +100,10 @@ PINOCCHIO_EE_FRAME_NAMES: tuple[str, ...] = (
 
 
 # =============================================================================
-# Robotiq gripper internal joints in MuJoCo replay model
+# Robotiq gripper names in MuJoCo replay model
 # =============================================================================
-# These joints exist only in the MuJoCo replay model qpos/qvel.
-# They are not part of the Pinocchio model.
-#
-# In the OCP, each gripper is represented by one normalized command coordinate:
-#   left_gripper_opening  in [0, 1]
-#   right_gripper_opening in [0, 1]
+# These joints/actuators exist only in the MuJoCo replay model.
+# They are NOT part of the OCP decision variables.
 
 LEFT_GRIPPER_JOINT_NAMES: tuple[str, ...] = (
     "left_2f85_left_driver_joint",
@@ -149,7 +144,7 @@ MUJOCO_FULL_JOINT_NAMES: tuple[str, ...] = MUJOCO_REPLAY_JOINT_NAMES
 # - These are MuJoCo XML actuator names.
 # - For G1, XML actuators are position actuators.
 # - For Robotiq, XML actuator ctrl is a command range [0, 255].
-# - These are used for MuJoCo replay/viewer, not directly as OCP torque inputs.
+# - These are used for MuJoCo replay/viewer, not as OCP torque inputs.
 
 MUJOCO_POSITION_ACTUATOR_NAMES: tuple[str, ...] = ACTIVE_G1_JOINT_NAMES
 
@@ -165,15 +160,15 @@ MUJOCO_ACTUATOR_NAMES: tuple[str, ...] = (
 
 
 # =============================================================================
-# Gripper command normalization
+# Gripper command normalization for replay
 # =============================================================================
+# Gripper is not part of OCP.
+# These helpers are kept only for MuJoCo replay/task logic.
+#
 # MuJoCo Robotiq actuator:
 #   ctrlrange = [0, 255]
 #
-# OCP reduced gripper coordinate:
-#   left_gripper_opening, right_gripper_opening in [0, 1]
-#
-# Convention:
+# Normalized command convention:
 #   0.0 = open / minimum command
 #   1.0 = close / maximum command
 
@@ -189,7 +184,7 @@ GRIPPER_COMMAND_TO_MUJOCO_CTRL_SCALE = (
 
 GRIPPER_COMMAND_TO_MUJOCO_CTRL_OFFSET = MUJOCO_GRIPPER_CTRL_MIN
 
-OCP_GRIPPER_COORDINATE_LIMITS: Mapping[str, tuple[float, float]] = {
+GRIPPER_COMMAND_LIMITS: Mapping[str, tuple[float, float]] = {
     "left_gripper_opening": (GRIPPER_COMMAND_MIN, GRIPPER_COMMAND_MAX),
     "right_gripper_opening": (GRIPPER_COMMAND_MIN, GRIPPER_COMMAND_MAX),
 }
@@ -208,7 +203,9 @@ MUJOCO_GRIPPER_CTRL_LIMITS: Mapping[str, tuple[float, float]] = {
 
 def gripper_command_to_mujoco_ctrl(command: float) -> float:
     """
-    Convert normalized OCP gripper command in [0, 1] to MuJoCo ctrl in [0, 255].
+    Convert normalized gripper command in [0, 1] to MuJoCo ctrl in [0, 255].
+
+    This is for replay/task logic only. Gripper command is not an OCP variable.
     """
     if command < GRIPPER_COMMAND_MIN or command > GRIPPER_COMMAND_MAX:
         raise ValueError(
@@ -224,7 +221,9 @@ def gripper_command_to_mujoco_ctrl(command: float) -> float:
 
 def mujoco_ctrl_to_gripper_command(ctrl: float) -> float:
     """
-    Convert MuJoCo gripper ctrl in [0, 255] to normalized OCP command in [0, 1].
+    Convert MuJoCo gripper ctrl in [0, 255] to normalized command in [0, 1].
+
+    This is for replay/task logic only. Gripper command is not an OCP variable.
     """
     if ctrl < MUJOCO_GRIPPER_CTRL_MIN or ctrl > MUJOCO_GRIPPER_CTRL_MAX:
         raise ValueError(
@@ -239,43 +238,22 @@ def mujoco_ctrl_to_gripper_command(ctrl: float) -> float:
 
 
 # =============================================================================
-# OCP reduced coordinates and controls
+# OCP coordinates and controls
 # =============================================================================
-# OCP reduced model:
+# Gripper is NOT part of the optimization problem.
 #
-#   q_ocp = [
-#       17 G1 upper-body joint positions,
-#       left_gripper_opening,
-#       right_gripper_opening,
-#   ]
+# OCP state:
+#   q_ocp = 17 G1 upper-body joint positions
+#   v_ocp = 17 G1 upper-body joint velocities
 #
-#   v_ocp = [
-#       17 G1 upper-body joint velocities,
-#       left_gripper_opening_velocity,
-#       right_gripper_opening_velocity,
-#   ]
+# OCP control:
+#   u_ocp = 17 G1 joint torques
 #
-#   u_ocp = [
-#       17 G1 joint torques,
-#       left_gripper_effort,
-#       right_gripper_effort,
-#   ]
-#
-# Pinocchio handles only the first 17 G1 coordinates.
-# The last 2 gripper coordinates are scalar OCP variables and are mapped to
-# MuJoCo gripper commands during replay/checking.
+# MuJoCo replay may still close/open the gripper using separate task logic.
 
 OCP_G1_JOINT_NAMES: tuple[str, ...] = PINOCCHIO_JOINT_NAMES
 
-OCP_GRIPPER_COORDINATE_NAMES: tuple[str, ...] = (
-    "left_gripper_opening",
-    "right_gripper_opening",
-)
-
-OCP_COORDINATE_NAMES: tuple[str, ...] = (
-    OCP_G1_JOINT_NAMES
-    + OCP_GRIPPER_COORDINATE_NAMES
-)
+OCP_COORDINATE_NAMES: tuple[str, ...] = OCP_G1_JOINT_NAMES
 
 OCP_DEFAULT_VELOCITY_LIMIT: tuple[float, float] = (-10.0, 10.0)
 
@@ -284,19 +262,9 @@ OCP_VELOCITY_LIMITS: Mapping[str, tuple[float, float]] = {
     for name in OCP_COORDINATE_NAMES
 }
 
-OCP_G1_TORQUE_NAMES: tuple[str, ...] = tuple(
+OCP_CONTROL_NAMES: tuple[str, ...] = tuple(
     f"{joint_name}_torque"
     for joint_name in OCP_G1_JOINT_NAMES
-)
-
-OCP_GRIPPER_EFFORT_NAMES: tuple[str, ...] = (
-    "left_gripper_effort",
-    "right_gripper_effort",
-)
-
-OCP_CONTROL_NAMES: tuple[str, ...] = (
-    OCP_G1_TORQUE_NAMES
-    + OCP_GRIPPER_EFFORT_NAMES
 )
 
 OUTPUT_COORDINATE_NAMES: tuple[str, ...] = OCP_COORDINATE_NAMES
@@ -305,6 +273,14 @@ OUTPUT_VELOCITY_NAMES: tuple[str, ...] = tuple(
     f"{name}_velocity"
     for name in OUTPUT_COORDINATE_NAMES
 )
+
+# Backward-compatible empty aliases.
+# These are intentionally empty because gripper is no longer optimized.
+OCP_GRIPPER_COORDINATE_NAMES: tuple[str, ...] = ()
+OCP_GRIPPER_EFFORT_NAMES: tuple[str, ...] = ()
+OCP_GRIPPER_COORDINATE_LIMITS: Mapping[str, tuple[float, float]] = {}
+
+OCP_G1_TORQUE_NAMES: tuple[str, ...] = OCP_CONTROL_NAMES
 
 
 # =============================================================================
@@ -315,7 +291,9 @@ N_PINOCCHIO_Q = len(PINOCCHIO_JOINT_NAMES)
 N_PINOCCHIO_V = len(PINOCCHIO_JOINT_NAMES)
 
 N_G1_ACTIVE_JOINTS = len(ACTIVE_G1_JOINT_NAMES)
-N_GRIPPER_COORDINATES = len(OCP_GRIPPER_COORDINATE_NAMES)
+
+# Gripper exists in MuJoCo replay but is not part of OCP.
+N_GRIPPER_COORDINATES = 0
 
 NQ_OCP = len(OCP_COORDINATE_NAMES)
 NV_OCP = len(OCP_COORDINATE_NAMES)
@@ -359,20 +337,22 @@ class G1GripperConfig:
     mujoco_gripper_actuator_names: tuple[str, ...]
     mujoco_actuator_names: tuple[str, ...]
 
-    # Gripper command mapping
-    ocp_gripper_coordinate_limits: Mapping[str, tuple[float, float]]
+    # Gripper replay command mapping
+    gripper_command_limits: Mapping[str, tuple[float, float]]
     mujoco_gripper_ctrl_limits: Mapping[str, tuple[float, float]]
     gripper_command_to_mujoco_ctrl_scale: float
     gripper_command_to_mujoco_ctrl_offset: float
 
-    # OCP reduced model names
+    # OCP model names
     ocp_g1_joint_names: tuple[str, ...]
-    ocp_gripper_coordinate_names: tuple[str, ...]
     ocp_coordinate_names: tuple[str, ...]
-    ocp_g1_torque_names: tuple[str, ...]
-    ocp_gripper_effort_names: tuple[str, ...]
     ocp_control_names: tuple[str, ...]
     ocp_velocity_limits: Mapping[str, tuple[float, float]]
+
+    # Backward-compatible empty fields
+    ocp_gripper_coordinate_names: tuple[str, ...]
+    ocp_gripper_effort_names: tuple[str, ...]
+    ocp_gripper_coordinate_limits: Mapping[str, tuple[float, float]]
 
     # Output trajectory names
     output_coordinate_names: tuple[str, ...]
@@ -412,18 +392,19 @@ G1_GRIPPER_CONFIG = G1GripperConfig(
     mujoco_gripper_actuator_names=MUJOCO_GRIPPER_ACTUATOR_NAMES,
     mujoco_actuator_names=MUJOCO_ACTUATOR_NAMES,
 
-    ocp_gripper_coordinate_limits=OCP_GRIPPER_COORDINATE_LIMITS,
+    gripper_command_limits=GRIPPER_COMMAND_LIMITS,
     mujoco_gripper_ctrl_limits=MUJOCO_GRIPPER_CTRL_LIMITS,
     gripper_command_to_mujoco_ctrl_scale=GRIPPER_COMMAND_TO_MUJOCO_CTRL_SCALE,
     gripper_command_to_mujoco_ctrl_offset=GRIPPER_COMMAND_TO_MUJOCO_CTRL_OFFSET,
 
     ocp_g1_joint_names=OCP_G1_JOINT_NAMES,
-    ocp_gripper_coordinate_names=OCP_GRIPPER_COORDINATE_NAMES,
     ocp_coordinate_names=OCP_COORDINATE_NAMES,
-    ocp_g1_torque_names=OCP_G1_TORQUE_NAMES,
-    ocp_gripper_effort_names=OCP_GRIPPER_EFFORT_NAMES,
     ocp_control_names=OCP_CONTROL_NAMES,
     ocp_velocity_limits=OCP_VELOCITY_LIMITS,
+
+    ocp_gripper_coordinate_names=OCP_GRIPPER_COORDINATE_NAMES,
+    ocp_gripper_effort_names=OCP_GRIPPER_EFFORT_NAMES,
+    ocp_gripper_coordinate_limits=OCP_GRIPPER_COORDINATE_LIMITS,
 
     output_coordinate_names=OUTPUT_COORDINATE_NAMES,
     output_velocity_names=OUTPUT_VELOCITY_NAMES,
@@ -440,23 +421,65 @@ G1_GRIPPER_CONFIG = G1GripperConfig(
 
 
 # =============================================================================
-# MuJoCo replay model validation
+# Validation
 # =============================================================================
+
+def validate_pinocchio_model(model: pin.Model) -> None:
+    """
+    Validate the Pinocchio upper-body model.
+
+    Expected:
+    - 17 generalized coordinates
+    - 17 velocities
+    - waist + left arm + right arm joints
+    - left/right virtual gripper EE frames
+    """
+    errors: list[str] = []
+
+    if model.nq != NQ_OCP:
+        errors.append(f"Expected Pinocchio nq={NQ_OCP}, got {model.nq}")
+
+    if model.nv != NV_OCP:
+        errors.append(f"Expected Pinocchio nv={NV_OCP}, got {model.nv}")
+
+    joint_names = set(str(name) for name in model.names)
+    frame_names = set(frame.name for frame in model.frames)
+
+    missing_joints = [
+        name
+        for name in PINOCCHIO_JOINT_NAMES
+        if name not in joint_names
+    ]
+
+    missing_frames = [
+        name
+        for name in PINOCCHIO_EE_FRAME_NAMES
+        if name not in frame_names
+    ]
+
+    if missing_joints:
+        errors.append(f"Missing Pinocchio joints: {missing_joints}")
+
+    if missing_frames:
+        errors.append(f"Missing Pinocchio EE frames: {missing_frames}")
+
+    if errors:
+        raise ValueError("Invalid Pinocchio G1 model:\n" + "\n".join(errors))
+
 
 def validate_mujoco_replay_model(model: mujoco.MjModel) -> None:
     """
     Validate that the MuJoCo replay model contains all names required by
-    the G1 gripper configuration.
+    the G1 gripper replay configuration.
 
-    This validates the G1_with_gripper.xml model:
+    This validates G1_with_gripper.xml:
     - 17 active G1 upper-body joints
     - 12 Robotiq internal joints
     - 19 MuJoCo actuators
     - 2 gripper end-effector sites
 
-    It does not validate OCP reduced coordinate names because names such as
-    'left_gripper_opening' and 'right_gripper_opening' are conceptual OCP
-    coordinates, not MuJoCo joint names.
+    It does not validate OCP gripper variables because gripper is not part
+    of the OCP decision variables.
     """
     joint_names = set(get_joint_names(model))
     actuator_names = set(get_actuator_names(model))
@@ -483,13 +506,13 @@ def validate_mujoco_replay_model(model: mujoco.MjModel) -> None:
     errors: list[str] = []
 
     if missing_joints:
-        errors.append(f"Missing joints: {missing_joints}")
+        errors.append(f"Missing MuJoCo joints: {missing_joints}")
 
     if missing_actuators:
-        errors.append(f"Missing actuators: {missing_actuators}")
+        errors.append(f"Missing MuJoCo actuators: {missing_actuators}")
 
     if missing_sites:
-        errors.append(f"Missing sites: {missing_sites}")
+        errors.append(f"Missing MuJoCo sites: {missing_sites}")
 
     if errors:
         raise ValueError("Invalid MuJoCo replay model:\n" + "\n".join(errors))
