@@ -30,7 +30,7 @@ class CasadiPinocchioKinematics:
 
     where:
         q = 17 G1 upper-body joint positions
-        x = [q; v] ∈ R34
+        x = [q; v] in R34
 
     Frame convention:
         EE positions are expressed in the Pinocchio pelvis/base frame.
@@ -58,7 +58,6 @@ class CasadiPinocchioKinematics:
         self,
         q: Sequence[float] | np.ndarray,
     ) -> np.ndarray:
-        """Evaluate left EE position numerically."""
         q_vec = as_vector(q, size=self.nq, name="q")
 
         return evaluate_vector_function(
@@ -72,7 +71,6 @@ class CasadiPinocchioKinematics:
         self,
         q: Sequence[float] | np.ndarray,
     ) -> np.ndarray:
-        """Evaluate right EE position numerically."""
         q_vec = as_vector(q, size=self.nq, name="q")
 
         return evaluate_vector_function(
@@ -87,7 +85,7 @@ class CasadiPinocchioKinematics:
         q: Sequence[float] | np.ndarray,
     ) -> np.ndarray:
         """
-        Evaluate stacked dual-EE position numerically.
+        Evaluate stacked dual-EE position.
 
         Returns
         -------
@@ -108,7 +106,7 @@ class CasadiPinocchioKinematics:
         x: Sequence[float] | np.ndarray,
     ) -> np.ndarray:
         """
-        Evaluate stacked dual-EE position from state x = [q; v].
+        Evaluate stacked dual-EE position from x = [q; v].
         """
         x_vec = as_vector(x, size=self.nx, name="x")
 
@@ -155,9 +153,7 @@ def _frame_position_expr(
     cpin.forwardKinematics(cmodel, cdata, q)
     cpin.updateFramePlacements(cmodel, cdata)
 
-    placement = cdata.oMf[frame_id]
-
-    return placement.translation
+    return cdata.oMf[frame_id].translation
 
 
 def build_casadi_pinocchio_kinematics(
@@ -169,22 +165,6 @@ def build_casadi_pinocchio_kinematics(
 ) -> CasadiPinocchioKinematics:
     """
     Build CasADi symbolic dual-EE kinematics functions.
-
-    Parameters
-    ----------
-    model:
-        Numeric Pinocchio model.
-
-    left_frame_name, right_frame_name:
-        EE frame names in the Pinocchio model.
-
-    name_prefix:
-        Prefix for CasADi function names.
-
-    Returns
-    -------
-    kin:
-        CasadiPinocchioKinematics object.
     """
     _validate_fixed_base_model(model)
 
@@ -248,7 +228,6 @@ def build_casadi_pinocchio_kinematics(
 
     # -------------------------------------------------------------------------
     # x-based EE position function
-    # Useful inside OCP because decision variable is x = [q; v].
     # -------------------------------------------------------------------------
     p_left_x = _frame_position_expr(
         cmodel,
