@@ -32,6 +32,30 @@ from manipulation_ocp.robots.g1_gripper import (
 from manipulation_ocp.task.stages import StageResult, TaskPlanResult
 from manipulation_ocp.utils.paths import G1_GRIPPER_SCENE_XML
 
+RGBA = tuple[float, float, float, float]
+RGBAPalette = tuple[RGBA, ...]
+
+
+def _validate_rgba(rgba: RGBA, *, name: str) -> None:
+    arr = np.asarray(rgba, dtype=float).reshape(-1)
+
+    if arr.size != 4:
+        raise ValueError(f"{name} must have 4 values, got {arr.shape}")
+
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain finite values, got {rgba}")
+
+    if np.any(arr < 0.0) or np.any(arr > 1.0):
+        raise ValueError(f"{name} values must be in [0, 1], got {rgba}")
+
+
+def _validate_rgba_palette(palette: RGBAPalette, *, name: str) -> None:
+    if len(palette) == 0:
+        raise ValueError(f"{name} must not be empty")
+
+    for i, rgba in enumerate(palette):
+        _validate_rgba(rgba, name=f"{name}[{i}]")
+
 
 @dataclass(frozen=True)
 class MujocoTaskExecutorConfig:
@@ -68,17 +92,19 @@ class MujocoTaskExecutorConfig:
     print_stage: bool = True
 
     # EE path line.
+    # For mjGEOM_LINE, MuJoCo interprets this value in screen pixels.
+    # Use values such as 2.0, 4.0, 8.0 if you want a visible difference.
     draw_ee_path: bool = True
     ee_path_max_points: int = 3000
-    ee_path_line_width: float = 0.006
+    ee_path_line_width: float = 4.0
 
-    left_ee_path_rgba: tuple[float, float, float, float] = (
+    left_ee_path_rgba: RGBA = (
         0.0,
         0.75,
         1.0,
         1.0,
     )
-    right_ee_path_rgba: tuple[float, float, float, float] = (
+    right_ee_path_rgba: RGBA = (
         1.0,
         0.45,
         0.0,
@@ -89,13 +115,13 @@ class MujocoTaskExecutorConfig:
     draw_current_ee_points: bool = True
     current_ee_point_size: float = 0.018
 
-    left_current_ee_rgba: tuple[float, float, float, float] = (
+    left_current_ee_rgba: RGBA = (
         0.0,
         1.0,
         1.0,
         1.0,
     )
-    right_current_ee_rgba: tuple[float, float, float, float] = (
+    right_current_ee_rgba: RGBA = (
         1.0,
         0.75,
         0.0,
@@ -106,17 +132,32 @@ class MujocoTaskExecutorConfig:
     draw_command_points: bool = True
     command_point_size: float = 0.022
 
-    left_command_point_rgba: tuple[float, float, float, float] = (
+    # Backward-compatible single colors. These are kept so old configs do not
+    # break, but drawing below uses the palettes by default.
+    left_command_point_rgba: RGBA = (
         0.0,
         0.2,
         1.0,
         1.0,
     )
-    right_command_point_rgba: tuple[float, float, float, float] = (
+    right_command_point_rgba: RGBA = (
         1.0,
         0.1,
         0.0,
         1.0,
+    )
+
+    # Three-color command palettes.
+    # Point color is selected by command target index: 0, 1, 2, then repeats.
+    left_command_point_palette_rgba: RGBAPalette = (
+        (1.0, 0.0, 0.0, 1.0),   # red
+        (1.0, 0.75, 0.0, 1.0),  # yellow/orange
+        (0.7, 0.0, 1.0, 1.0),   # violet
+    )
+    right_command_point_palette_rgba: RGBAPalette = (
+        (0.0, 0.2, 1.0, 1.0),   # blue
+        (0.0, 1.0, 1.0, 1.0),   # cyan
+        (0.2, 1.0, 0.2, 1.0),   # green
     )
 
     # OCP command targets are produced in Pinocchio pelvis/base frame.
@@ -162,6 +203,25 @@ class MujocoTaskExecutorConfig:
 
             if value <= 0.0:
                 raise ValueError(f"{name} must be > 0, got {value}")
+
+        for name, rgba in {
+            "left_ee_path_rgba": self.left_ee_path_rgba,
+            "right_ee_path_rgba": self.right_ee_path_rgba,
+            "left_current_ee_rgba": self.left_current_ee_rgba,
+            "right_current_ee_rgba": self.right_current_ee_rgba,
+            "left_command_point_rgba": self.left_command_point_rgba,
+            "right_command_point_rgba": self.right_command_point_rgba,
+        }.items():
+            _validate_rgba(rgba, name=name)
+
+        _validate_rgba_palette(
+            self.left_command_point_palette_rgba,
+            name="left_command_point_palette_rgba",
+        )
+        _validate_rgba_palette(
+            self.right_command_point_palette_rgba,
+            name="right_command_point_palette_rgba",
+        )
 
         if not isinstance(self.command_frame_body_name, str):
             raise TypeError(
@@ -401,14 +461,15 @@ class MujocoTaskExecutor:
         point: np.ndarray,
         *,
         atol: float = 1e-9,
-    ) -> None:
+    ) -> bool:
         p = np.asarray(point, dtype=float).reshape(3)
 
         for old in points:
             if np.linalg.norm(old - p) <= atol:
-                return
+                return False
 
         points.append(p.copy())
+        return True
 
     def _base_point_to_world(self, point_base: np.ndarray) -> np.ndarray:
         """
@@ -504,13 +565,26 @@ class MujocoTaskExecutor:
         if len(self.right_ee_path) > max_points:
             self.right_ee_path = self.right_ee_path[-max_points:]
 
+    @staticmethod
+    def _palette_color(
+        palette: RGBAPalette,
+        index: int,
+    ) -> RGBA:
+        """
+        Return a repeating palette color.
+        """
+        if len(palette) == 0:
+            raise ValueError("palette must not be empty")
+
+        return palette[index % len(palette)]
+
     def _add_line_to_user_scene(
         self,
         *,
         viewer: Any,
         p0: np.ndarray,
         p1: np.ndarray,
-        rgba: tuple[float, float, float, float],
+        rgba: RGBA,
     ) -> None:
         """
         Add one line segment to viewer.user_scn.
@@ -548,7 +622,7 @@ class MujocoTaskExecutor:
         viewer: Any,
         position: np.ndarray,
         radius: float,
-        rgba: tuple[float, float, float, float],
+        rgba: RGBA,
     ) -> None:
         """
         Add one sphere point to viewer.user_scn.
@@ -607,7 +681,10 @@ class MujocoTaskExecutor:
 
     def _draw_command_points(self, viewer: Any | None) -> None:
         """
-        Draw target command points.
+        Draw command target points.
+
+        Each command point gets a color from a three-color palette based on its
+        index. This makes target 1, target 2, target 3 visually distinct.
         """
         if not self.config.draw_command_points:
             return
@@ -615,20 +692,26 @@ class MujocoTaskExecutor:
         if viewer is None or not hasattr(viewer, "user_scn"):
             return
 
-        for p in self.left_command_points:
+        for i, p in enumerate(self.left_command_points):
             self._add_sphere_to_user_scene(
                 viewer=viewer,
                 position=p,
                 radius=self.config.command_point_size,
-                rgba=self.config.left_command_point_rgba,
+                rgba=self._palette_color(
+                    self.config.left_command_point_palette_rgba,
+                    i,
+                ),
             )
 
-        for p in self.right_command_points:
+        for i, p in enumerate(self.right_command_points):
             self._add_sphere_to_user_scene(
                 viewer=viewer,
                 position=p,
                 radius=self.config.command_point_size,
-                rgba=self.config.right_command_point_rgba,
+                rgba=self._palette_color(
+                    self.config.right_command_point_palette_rgba,
+                    i,
+                ),
             )
 
     def _draw_current_ee_points(self, viewer: Any | None) -> None:
@@ -1057,14 +1140,16 @@ class MujocoTaskExecutor:
         duration: float,
     ) -> bool:
         """
-        Hold current MuJoCo state for a short time.
+        Hold current state for a short duration.
         """
+        duration = float(duration)
+
         if duration <= 0.0:
             return True
 
-        n = max(1, int(np.ceil(duration / self.config.dt)))
+        num_samples = max(1, int(round(duration / self.config.dt)))
 
-        for _ in range(n):
+        for _ in range(num_samples):
             ok = self._advance_sample(
                 viewer=viewer,
                 sample_dt=self.config.dt,
@@ -1076,26 +1161,25 @@ class MujocoTaskExecutor:
 
         return True
 
-    def execute_stage(
+    def _execute_stage(
         self,
         stage: StageResult,
         *,
-        viewer: Any | None = None,
+        stage_index: int,
+        viewer: Any | None,
     ) -> bool:
         """
-        Execute one StageResult.
-
-        Order:
-            1. OCP reference if available.
-            2. Else gripper-only trajectory if available.
-            3. Return-arm trajectory if available.
-            4. Optional stage pause.
+        Execute one planned stage.
         """
         if self.config.print_stage:
-            print(f"[MuJoCo] stage: {stage.step_name}")
+            print("")
+            print("=" * 80)
+            print(f"[MuJoCo] stage {stage_index}: {stage.step_name}")
+            print("left action:", type(stage.left_action).__name__)
+            print("right action:", type(stage.right_action).__name__)
 
         if stage.has_ocp_reference:
-            ok = self._replay_qv_trajectory(
+            return self._replay_qv_trajectory(
                 q_traj=stage.ocp_q_ref,
                 v_traj=stage.ocp_v_ref,
                 time_ref=stage.ocp_time_ref,
@@ -1104,103 +1188,83 @@ class MujocoTaskExecutor:
                 viewer=viewer,
             )
 
-            if not ok:
-                return False
-
-            gripper_was_consumed = stage.has_gripper_command
-        else:
-            gripper_was_consumed = False
-
-        if stage.has_gripper_command and not gripper_was_consumed:
-            ok = self._replay_gripper_only(
+        if stage.has_return_trajectory:
+            return self._replay_qv_trajectory(
+                q_traj=stage.q_return_traj,
+                v_traj=stage.v_return_traj,
+                time_ref=None,
                 left_gripper_traj=stage.left_gripper_command_traj,
                 right_gripper_traj=stage.right_gripper_command_traj,
                 viewer=viewer,
             )
 
-            if not ok:
-                return False
-
-        if stage.has_return_trajectory:
-            ok = self._replay_qv_trajectory(
-                q_traj=stage.q_return_traj,
-                v_traj=stage.v_return_traj,
-                time_ref=None,
-                left_gripper_traj=None,
-                right_gripper_traj=None,
+        if stage.has_gripper_command:
+            return self._replay_gripper_only(
+                left_gripper_traj=stage.left_gripper_command_traj,
+                right_gripper_traj=stage.right_gripper_command_traj,
                 viewer=viewer,
             )
 
-            if not ok:
-                return False
-
-        if self.config.pause_between_stages:
-            ok = self._hold(
-                viewer=viewer,
-                duration=self.config.stage_pause_time,
-            )
-
-            if not ok:
-                return False
-
-        return True
+        # Empty/hold-only stage.
+        return self._hold(
+            viewer=viewer,
+            duration=self.config.dt,
+        )
 
     def execute_plan(
         self,
         plan: TaskPlanResult,
         *,
         viewer: Any | None = None,
-    ) -> None:
+    ) -> bool:
         """
-        Execute a full task plan.
+        Execute a complete TaskPlanResult in MuJoCo.
 
-        If viewer is provided, reuse it.
-        If config.show_viewer=True and viewer is None, this opens a MuJoCo
-        passive viewer.
+        If viewer is None and config.show_viewer is True, this method opens a
+        passive MuJoCo viewer and keeps it alive until the replay finishes.
         """
-        self.reset_ee_paths()
-        self.collect_command_points_from_plan(plan)
-        self._record_ee_path_sample()
+        if viewer is None and self.config.show_viewer:
+            with self.launch_viewer() as launched_viewer:
+                ok = self.execute_plan(plan, viewer=launched_viewer)
+                self.keep_viewer_alive_until_closed(launched_viewer)
+                return ok
 
-        if viewer is not None:
-            for stage in plan.stage_results:
-                ok = self.execute_stage(stage, viewer=viewer)
+        if not self.left_command_points and not self.right_command_points:
+            self.collect_command_points_from_plan(plan)
+
+        ok = self._sync_viewer(viewer)
+
+        if not ok:
+            return False
+
+        for i, stage in enumerate(plan.stage_results):
+            ok = self._execute_stage(
+                stage,
+                stage_index=i,
+                viewer=viewer,
+            )
+
+            if not ok:
+                return False
+
+            is_last_stage = i == len(plan.stage_results) - 1
+
+            if self.config.pause_between_stages and not is_last_stage:
+                ok = self._hold(
+                    viewer=viewer,
+                    duration=self.config.stage_pause_time,
+                )
 
                 if not ok:
-                    print("[MuJoCo] viewer closed. Stop execution.")
-                    return
+                    return False
 
-            self._hold(
+        if self.config.hold_final_time > 0.0:
+            ok = self._hold(
                 viewer=viewer,
                 duration=self.config.hold_final_time,
             )
-            return
-
-        if self.config.show_viewer:
-            with self.launch_viewer() as local_viewer:
-                for stage in plan.stage_results:
-                    ok = self.execute_stage(stage, viewer=local_viewer)
-
-                    if not ok:
-                        print("[MuJoCo] viewer closed. Stop execution.")
-                        return
-
-                self._hold(
-                    viewer=local_viewer,
-                    duration=self.config.hold_final_time,
-                )
-
-                self.keep_viewer_alive_until_closed(local_viewer)
-
-            return
-
-        for stage in plan.stage_results:
-            ok = self.execute_stage(stage, viewer=None)
 
             if not ok:
-                return
+                return False
 
-        self._hold(
-            viewer=None,
-            duration=self.config.hold_final_time,
-        )
+        return self._sync_viewer(viewer)

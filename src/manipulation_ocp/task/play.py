@@ -85,8 +85,8 @@ def build_demo_steps(
         7. right opens gripper
         8. right returns home
     """
-    left_pick_target = left_home + np.array([0.03, 0.00, 0.02])
-    right_pick_target = right_home + np.array([0.03, 0.00, 0.02])
+    left_pick_target = left_home + np.array([0.1, 0.1, 0.0])
+    right_pick_target = right_home + np.array([-0.1, 0.01, 0.0])
 
     return [
         ParallelArmStep(
@@ -101,7 +101,7 @@ def build_demo_steps(
         ),
         ParallelArmStep(
             name="left_lift_right_reach",
-            left=LiftAction(side="left", dz=0.04),
+            left=LiftAction(side="left", dz=0.1),
             right=ReachAction(side="right", target=right_pick_target),
         ),
         ParallelArmStep(
@@ -112,7 +112,7 @@ def build_demo_steps(
         ParallelArmStep(
             name="left_open_right_lift",
             left=GripperAction(side="left", command=0.0, duration=0.4),
-            right=LiftAction(side="right", dz=0.04),
+            right=LiftAction(side="right", dz=0.1),
         ),
         ParallelArmStep(
             name="left_return_home",
@@ -271,7 +271,7 @@ def build_executor(
             realtime=realtime,
             reset_keyframe="home",
             pause_between_stages=True,
-            stage_pause_time=0.25,
+            stage_pause_time=0.5,
             hold_final_time=0.5,
             print_stage=True,
             draw_ee_path=draw_ee_path,
@@ -279,9 +279,9 @@ def build_executor(
             draw_current_ee_points=draw_current_ee_points,
 
             # Smaller visual markers.
-            ee_path_line_width=0.1,
-            current_ee_point_size=0.005,
-            command_point_size=0.005,
+            ee_path_line_width=8.0,
+            current_ee_point_size=0.015,
+            command_point_size=0.015,
 
             # OCP command targets are in pelvis/base frame.
             command_points_are_in_base_frame=True,
@@ -347,7 +347,7 @@ def main() -> None:
             "ipopt.max_iter": 100,
             "ipopt.tol": 1e-4,
             "ipopt.acceptable_tol": 1e-3,
-            "ipopt.acceptable_iter": 5,
+            "ipopt.acceptable_iter": 10,
             "expand": True,
         }
 
