@@ -11,14 +11,30 @@ from manipulation_ocp.mujoco.info import (
     get_joint_names,
     get_site_names,
 )
-from manipulation_ocp.utils.paths import G1_GRIPPER_XML
+from manipulation_ocp.utils.paths import (
+    G1_FIXED_BASE_XML,
+    G1_GRIPPER_XML,
+)
 
 
 # =============================================================================
-# Robot asset
+# Robot assets
 # =============================================================================
+# Pinocchio backend:
+#   - uses upper-body fixed-base G1 model
+#   - 17 DoF: waist + two arms
+#   - used for FK, Jacobian, IK, dynamics, OCP
+#
+# MuJoCo replay backend:
+#   - uses G1 + Robotiq grippers model
+#   - used for viewer/replay and checking gripper open/close behavior
 
-XML_PATH: Path = G1_GRIPPER_XML
+PINOCCHIO_MODEL_XML: Path = G1_FIXED_BASE_XML
+MUJOCO_REPLAY_XML: Path = G1_GRIPPER_XML
+
+# Backward-compatible alias.
+# Prefer PINOCCHIO_MODEL_XML or MUJOCO_REPLAY_XML in new code.
+XML_PATH: Path = MUJOCO_REPLAY_XML
 
 
 # =============================================================================
@@ -59,11 +75,40 @@ ACTIVE_G1_JOINT_NAMES: tuple[str, ...] = (
 
 
 # =============================================================================
-# Robotiq gripper internal joints in MuJoCo full model
+# Pinocchio model names
 # =============================================================================
-# These joints exist in MuJoCo qpos/qvel, but they are not treated as
-# independent OCP coordinates. Each gripper is represented in OCP by one
-# normalized command/opening coordinate in [0, 1].
+# The Pinocchio model is built from g1_fixed_base.xml after removing leg joints.
+# It contains exactly these 17 joints.
+#
+# Note:
+#   Pinocchio also has the "universe" joint internally, but it is not part of
+#   the actuated generalized coordinates.
+
+PINOCCHIO_JOINT_NAMES: tuple[str, ...] = ACTIVE_G1_JOINT_NAMES
+
+LEFT_EE_SITE_NAME = "left_2f85_grip_site"
+RIGHT_EE_SITE_NAME = "right_2f85_grip_site"
+
+EE_SITE_NAMES: Mapping[str, str] = {
+    "left": LEFT_EE_SITE_NAME,
+    "right": RIGHT_EE_SITE_NAME,
+}
+
+PINOCCHIO_EE_FRAME_NAMES: tuple[str, ...] = (
+    LEFT_EE_SITE_NAME,
+    RIGHT_EE_SITE_NAME,
+)
+
+
+# =============================================================================
+# Robotiq gripper internal joints in MuJoCo replay model
+# =============================================================================
+# These joints exist only in the MuJoCo replay model qpos/qvel.
+# They are not part of the Pinocchio model.
+#
+# In the OCP, each gripper is represented by one normalized command coordinate:
+#   left_gripper_opening  in [0, 1]
+#   right_gripper_opening in [0, 1]
 
 LEFT_GRIPPER_JOINT_NAMES: tuple[str, ...] = (
     "left_2f85_left_driver_joint",
@@ -88,10 +133,13 @@ GRIPPER_JOINT_NAMES: tuple[str, ...] = (
     + RIGHT_GRIPPER_JOINT_NAMES
 )
 
-MUJOCO_FULL_JOINT_NAMES: tuple[str, ...] = (
+MUJOCO_REPLAY_JOINT_NAMES: tuple[str, ...] = (
     ACTIVE_G1_JOINT_NAMES
     + GRIPPER_JOINT_NAMES
 )
+
+# Backward-compatible alias.
+MUJOCO_FULL_JOINT_NAMES: tuple[str, ...] = MUJOCO_REPLAY_JOINT_NAMES
 
 
 # =============================================================================
@@ -193,7 +241,7 @@ def mujoco_ctrl_to_gripper_command(ctrl: float) -> float:
 # =============================================================================
 # OCP reduced coordinates and controls
 # =============================================================================
-# OCP uses a reduced manipulation model:
+# OCP reduced model:
 #
 #   q_ocp = [
 #       17 G1 upper-body joint positions,
@@ -213,10 +261,11 @@ def mujoco_ctrl_to_gripper_command(ctrl: float) -> float:
 #       right_gripper_effort,
 #   ]
 #
-# MuJoCo full model still has 29 qpos/qvel because each Robotiq gripper has
-# internal linkage joints.
+# Pinocchio handles only the first 17 G1 coordinates.
+# The last 2 gripper coordinates are scalar OCP variables and are mapped to
+# MuJoCo gripper commands during replay/checking.
 
-OCP_G1_JOINT_NAMES: tuple[str, ...] = ACTIVE_G1_JOINT_NAMES
+OCP_G1_JOINT_NAMES: tuple[str, ...] = PINOCCHIO_JOINT_NAMES
 
 OCP_GRIPPER_COORDINATE_NAMES: tuple[str, ...] = (
     "left_gripper_opening",
@@ -259,21 +308,11 @@ OUTPUT_VELOCITY_NAMES: tuple[str, ...] = tuple(
 
 
 # =============================================================================
-# End-effector sites
-# =============================================================================
-
-LEFT_EE_SITE_NAME = "left_2f85_grip_site"
-RIGHT_EE_SITE_NAME = "right_2f85_grip_site"
-
-EE_SITE_NAMES: Mapping[str, str] = {
-    "left": LEFT_EE_SITE_NAME,
-    "right": RIGHT_EE_SITE_NAME,
-}
-
-
-# =============================================================================
 # Dimensions
 # =============================================================================
+
+N_PINOCCHIO_Q = len(PINOCCHIO_JOINT_NAMES)
+N_PINOCCHIO_V = len(PINOCCHIO_JOINT_NAMES)
 
 N_G1_ACTIVE_JOINTS = len(ACTIVE_G1_JOINT_NAMES)
 N_GRIPPER_COORDINATES = len(OCP_GRIPPER_COORDINATE_NAMES)
@@ -291,18 +330,29 @@ N_MUJOCO_ACTUATORS = len(MUJOCO_ACTUATOR_NAMES)
 
 @dataclass(frozen=True)
 class G1GripperConfig:
-    # Asset
+    # Assets
+    pinocchio_model_xml: Path
+    mujoco_replay_xml: Path
+
+    # Backward-compatible alias.
+    # Prefer pinocchio_model_xml or mujoco_replay_xml in new code.
     xml_path: Path
 
-    # MuJoCo full model names
+    # G1 upper-body groups
     waist_joint_names: tuple[str, ...]
     left_arm_joint_names: tuple[str, ...]
     right_arm_joint_names: tuple[str, ...]
     active_g1_joint_names: tuple[str, ...]
+
+    # Pinocchio model names
+    pinocchio_joint_names: tuple[str, ...]
+    pinocchio_ee_frame_names: tuple[str, ...]
+
+    # MuJoCo replay model names
     left_gripper_joint_names: tuple[str, ...]
     right_gripper_joint_names: tuple[str, ...]
     gripper_joint_names: tuple[str, ...]
-    mujoco_full_joint_names: tuple[str, ...]
+    mujoco_replay_joint_names: tuple[str, ...]
 
     # MuJoCo actuator names for replay/viewer
     mujoco_position_actuator_names: tuple[str, ...]
@@ -328,10 +378,12 @@ class G1GripperConfig:
     output_coordinate_names: tuple[str, ...]
     output_velocity_names: tuple[str, ...]
 
-    # End-effector sites
+    # End-effector frame/site names
     ee_site_names: Mapping[str, str]
 
     # Dimensions
+    n_pinocchio_q: int
+    n_pinocchio_v: int
     nq_ocp: int
     nv_ocp: int
     nu_ocp: int
@@ -339,16 +391,22 @@ class G1GripperConfig:
 
 
 G1_GRIPPER_CONFIG = G1GripperConfig(
+    pinocchio_model_xml=PINOCCHIO_MODEL_XML,
+    mujoco_replay_xml=MUJOCO_REPLAY_XML,
     xml_path=XML_PATH,
 
     waist_joint_names=WAIST_JOINT_NAMES,
     left_arm_joint_names=LEFT_ARM_JOINT_NAMES,
     right_arm_joint_names=RIGHT_ARM_JOINT_NAMES,
     active_g1_joint_names=ACTIVE_G1_JOINT_NAMES,
+
+    pinocchio_joint_names=PINOCCHIO_JOINT_NAMES,
+    pinocchio_ee_frame_names=PINOCCHIO_EE_FRAME_NAMES,
+
     left_gripper_joint_names=LEFT_GRIPPER_JOINT_NAMES,
     right_gripper_joint_names=RIGHT_GRIPPER_JOINT_NAMES,
     gripper_joint_names=GRIPPER_JOINT_NAMES,
-    mujoco_full_joint_names=MUJOCO_FULL_JOINT_NAMES,
+    mujoco_replay_joint_names=MUJOCO_REPLAY_JOINT_NAMES,
 
     mujoco_position_actuator_names=MUJOCO_POSITION_ACTUATOR_NAMES,
     mujoco_gripper_actuator_names=MUJOCO_GRIPPER_ACTUATOR_NAMES,
@@ -366,11 +424,14 @@ G1_GRIPPER_CONFIG = G1GripperConfig(
     ocp_gripper_effort_names=OCP_GRIPPER_EFFORT_NAMES,
     ocp_control_names=OCP_CONTROL_NAMES,
     ocp_velocity_limits=OCP_VELOCITY_LIMITS,
+
     output_coordinate_names=OUTPUT_COORDINATE_NAMES,
     output_velocity_names=OUTPUT_VELOCITY_NAMES,
 
     ee_site_names=EE_SITE_NAMES,
 
+    n_pinocchio_q=N_PINOCCHIO_Q,
+    n_pinocchio_v=N_PINOCCHIO_V,
     nq_ocp=NQ_OCP,
     nv_ocp=NV_OCP,
     nu_ocp=NU_OCP,
@@ -379,16 +440,16 @@ G1_GRIPPER_CONFIG = G1GripperConfig(
 
 
 # =============================================================================
-# Validation
+# MuJoCo replay model validation
 # =============================================================================
 
-def validate_g1_gripper_model(model: mujoco.MjModel) -> None:
+def validate_mujoco_replay_model(model: mujoco.MjModel) -> None:
     """
-    Validate that the loaded MuJoCo model contains all names required by
+    Validate that the MuJoCo replay model contains all names required by
     the G1 gripper configuration.
 
-    This validates the MuJoCo full model:
-    - 17 active G1 joints
+    This validates the G1_with_gripper.xml model:
+    - 17 active G1 upper-body joints
     - 12 Robotiq internal joints
     - 19 MuJoCo actuators
     - 2 gripper end-effector sites
@@ -403,7 +464,7 @@ def validate_g1_gripper_model(model: mujoco.MjModel) -> None:
 
     missing_joints = [
         name
-        for name in MUJOCO_FULL_JOINT_NAMES
+        for name in MUJOCO_REPLAY_JOINT_NAMES
         if name not in joint_names
     ]
 
@@ -431,7 +492,17 @@ def validate_g1_gripper_model(model: mujoco.MjModel) -> None:
         errors.append(f"Missing sites: {missing_sites}")
 
     if errors:
-        raise ValueError("Invalid G1 gripper model:\n" + "\n".join(errors))
+        raise ValueError("Invalid MuJoCo replay model:\n" + "\n".join(errors))
+
+
+# Backward-compatible alias.
+def validate_g1_gripper_model(model: mujoco.MjModel) -> None:
+    """
+    Validate MuJoCo replay model.
+
+    Deprecated name kept for compatibility. Prefer validate_mujoco_replay_model.
+    """
+    validate_mujoco_replay_model(model)
 
 
 def get_g1_gripper_config() -> G1GripperConfig:
