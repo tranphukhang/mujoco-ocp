@@ -12,9 +12,22 @@ def quadratic_cost(
     W: ca.DM,
 ) -> ca.MX:
     """
-    Weighted quadratic cost:
+    Weighted quadratic cost.
 
-        error.T @ W @ error
+        cost = error.T @ W @ error
+
+    Parameters
+    ----------
+    error:
+        Error vector.
+
+    W:
+        Positive semi-definite weight matrix.
+
+    Returns
+    -------
+    cost:
+        Scalar CasADi expression.
     """
     return ca.mtimes([error.T, W, error])
 
@@ -26,10 +39,17 @@ def split_state(
     nv: int,
 ) -> tuple[ca.MX, ca.MX]:
     """
-    Split x = [q; v].
+    Split state:
+
+        x = [q; v]
+
+    where:
+        q ∈ R^nq
+        v ∈ R^nv
     """
     q = x[0:nq]
     v = x[nq : nq + nv]
+
     return q, v
 
 
@@ -38,7 +58,7 @@ def build_dual_ee_stage_cost(
     x: ca.MX,
     u: ca.MX,
     kinematics: CasadiPinocchioKinematics,
-    p_ref,
+    p_ref: ca.MX,
     W_ee: ca.DM,
     W_v: ca.DM,
     W_u: ca.DM,
@@ -46,6 +66,16 @@ def build_dual_ee_stage_cost(
     nv: int,
 ) -> ca.MX:
     """
+    Build dual-end-effector stage cost.
+
+    This function is generic: it can be evaluated at a node or at an
+    implicit-midpoint collocation point.
+
+    In the current OCP formulation, it is evaluated at the interval midpoint:
+
+        x = x_mid
+        u = u_mid
+
     Stage cost:
 
         L(x, u)
@@ -53,14 +83,19 @@ def build_dual_ee_stage_cost(
           + ||v||^2_W_v
           + ||u||^2_W_u
 
-    Important:
-        p(q) depends only on q, not on full x = [q; v].
+    where:
 
-    Therefore this function uses:
+        x = [q; v]
+
+    Important:
+        End-effector position p(q) depends only on q, not on full state
+        x = [q; v].
+
+    Therefore this function intentionally uses:
+
         kinematics.dual_ee_position_fn(q)
 
-    instead of:
-        kinematics.dual_ee_position_x_fn(x)
+    instead of a full-state FK function.
 
     This keeps the CasADi graph smaller and makes the dependency structure
     clearer.
@@ -71,23 +106,29 @@ def build_dual_ee_stage_cost(
     p_error = p_pair - p_ref
 
     ee_cost = quadratic_cost(p_error, W_ee)
-    v_cost = quadratic_cost(v, W_v)
-    u_cost = quadratic_cost(u, W_u)
+    velocity_cost = quadratic_cost(v, W_v)
+    control_cost = quadratic_cost(u, W_u)
 
-    return ee_cost + v_cost + u_cost
+    return ee_cost + velocity_cost + control_cost
 
 
 def build_dual_ee_terminal_cost(
     *,
     x: ca.MX,
     kinematics: CasadiPinocchioKinematics,
-    p_ref,
+    p_ref: ca.MX,
     W_ee_f: ca.DM,
     W_v_f: ca.DM,
     nq: int,
     nv: int,
 ) -> ca.MX:
     """
+    Build dual-end-effector terminal cost.
+
+    Terminal cost is evaluated at the final node:
+
+        x = x_N = [q_N; v_N]
+
     Terminal cost:
 
         Phi(x_N)
@@ -95,7 +136,7 @@ def build_dual_ee_terminal_cost(
           + ||v_N||^2_W_v_f
 
     Important:
-        EE position only depends on q_N, not on v_N.
+        End-effector position p(q_N) depends only on q_N, not on v_N.
     """
     q, v = split_state(x, nq=nq, nv=nv)
 
@@ -103,6 +144,6 @@ def build_dual_ee_terminal_cost(
     p_error = p_pair - p_ref
 
     ee_terminal_cost = quadratic_cost(p_error, W_ee_f)
-    v_terminal_cost = quadratic_cost(v, W_v_f)
+    terminal_velocity_cost = quadratic_cost(v, W_v_f)
 
-    return ee_terminal_cost + v_terminal_cost
+    return ee_terminal_cost + terminal_velocity_cost
