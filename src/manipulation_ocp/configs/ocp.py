@@ -34,8 +34,8 @@ class FastDualEEOCPConfig:
     n_intervals: int = 20
 
     # Initial guess:
-    #   h_init = tf_init / n_intervals = 0.8 / 20 = 0.04 s
-    tf_init: float = 0.8
+    #   h_init = tf_init / n_intervals = 0.4 / 20 = 0.02 s
+    tf_init: float = 0.4
     tf_min: float = 0.4
     tf_max: float = 6.0
 

@@ -34,7 +34,7 @@ from manipulation_ocp.utils.numerics import as_vector
 @dataclass(frozen=True)
 class OCPInitialGuessData:
     """
-    Initial guess data for the OCP NLP.
+    Initial guess data for one OCP stage.
 
     Shapes:
         X_nodes = (N + 1, nx)
@@ -49,7 +49,7 @@ class OCPInitialGuessData:
 @dataclass(frozen=True)
 class FastDualEEOCPSolution:
     """
-    Parsed OCP solution.
+    Parsed OCP solution for one stage.
     """
 
     success: bool
@@ -64,6 +64,10 @@ class FastDualEEOCPSolution:
 
     q_nodes: np.ndarray
     v_nodes: np.ndarray
+
+    left_ee_target: np.ndarray
+    right_ee_target: np.ndarray
+    p_ref: np.ndarray
 
     raw_solution: dict[str, Any]
 
@@ -134,13 +138,46 @@ def _as_matrix(
     return arr
 
 
+def _check_within_bounds(
+    value: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    *,
+    name: str,
+    atol: float = 1e-9,
+) -> None:
+    """
+    Check value is within lower/upper bounds.
+
+    This is used before fixing X0 through lbx/ubx. If X0 is outside bounds,
+    the stage is immediately infeasible.
+    """
+    below = value < (lower - atol)
+    above = value > (upper + atol)
+
+    if np.any(below) or np.any(above):
+        bad_ids = np.where(below | above)[0].tolist()
+        raise ValueError(
+            f"{name} is outside bounds at indices {bad_ids}. "
+            f"min violation lower={np.min(value - lower)}, "
+            f"max violation upper={np.max(value - upper)}"
+        )
+
+
 class FastDualEEOCP:
     """
-    Fast dual-end-effector reaching OCP.
+    Fast multi-stage dual-end-effector reaching OCP.
 
     Design goal:
         Generate reference trajectories for RL reward shaping.
         Prioritize speed and stability over heavy planner accuracy.
+
+    Build once, solve many:
+        build_problem() creates the NLP graph and IPOPT solver once.
+        solve_stage(...) changes only:
+            - p_ref target parameter
+            - X0 fixed through lbx/ubx
+            - initial guess w0
 
     This version intentionally has:
         - no collision constraints
@@ -154,6 +191,9 @@ class FastDualEEOCP:
         Tf
         X_k = [q_k; v_k] ∈ R34, k = 0,...,N
         U_k = tau_k       ∈ R17, k = 0,...,N
+
+    Parameter:
+        P = p_ref = [p_left_ref; p_right_ref] ∈ R6
 
     Dynamics discretization:
         explicit Hermite-Simpson / cubic midpoint.
@@ -205,7 +245,6 @@ class FastDualEEOCP:
         self.solver_name = solver_name
 
         default_solver_options: dict[str, Any] = {
-            # Fast/debug-friendly defaults.
             "ipopt.print_level": 5,
             "ipopt.max_iter": 300,
             "ipopt.tol": 1e-4,
@@ -224,6 +263,8 @@ class FastDualEEOCP:
 
         self.problem_data: dict[str, Any] | None = None
         self.solution: dict[str, Any] | None = None
+
+        self.last_stage_data: dict[str, Any] | None = None
 
     def _build_default_bounds(
         self,
@@ -257,7 +298,7 @@ class FastDualEEOCP:
         initial_guess: OCPInitialGuessData | None,
     ) -> OCPInitialGuessData:
         """
-        Normalize initial guess.
+        Normalize initial guess for one stage.
 
         If no initial guess is provided:
             X_k = x0
@@ -321,48 +362,22 @@ class FastDualEEOCP:
     def build_problem(
         self,
         *,
-        x0_value: Sequence[float] | np.ndarray,
-        left_ee_target: Sequence[float] | np.ndarray,
-        right_ee_target: Sequence[float] | np.ndarray,
-        initial_guess: OCPInitialGuessData | None = None,
         x_min: Sequence[float] | np.ndarray | None = None,
         x_max: Sequence[float] | np.ndarray | None = None,
         u_min: Sequence[float] | np.ndarray | None = None,
         u_max: Sequence[float] | np.ndarray | None = None,
     ) -> None:
         """
-        Build the fast dual-EE OCP NLP.
+        Build the OCP NLP once.
 
-        Parameters
-        ----------
-        x0_value:
-            Initial state, shape (34,).
+        This does NOT take x0 or target.
 
-        left_ee_target, right_ee_target:
-            Target positions in Pinocchio pelvis/base frame, shape (3,).
-
-        initial_guess:
-            Warm-start data from IK/RNEA.
-
-        x_min, x_max:
-            Optional state bounds, shape (34,).
-
-        u_min, u_max:
-            Optional torque bounds, shape (17,).
+        Per-stage data is passed later through solve_stage(...):
+            - p_ref target through CasADi parameter P
+            - X0 fixed through lbx/ubx
+            - initial guess through solver x0=w0
         """
         cfg = self.config
-
-        x0_vec = as_vector(x0_value, size=self.nx, name="x0_value")
-
-        left_target = as_vector(left_ee_target, size=3, name="left_ee_target")
-        right_target = as_vector(
-            right_ee_target,
-            size=3,
-            name="right_ee_target",
-        )
-
-        p_ref_np = np.concatenate([left_target, right_target])
-        p_ref = ca.DM(p_ref_np)
 
         default_x_min, default_x_max, default_u_min, default_u_max = (
             self._build_default_bounds()
@@ -392,18 +407,12 @@ class FastDualEEOCP:
             else as_vector(u_max, size=self.nu, name="u_max")
         )
 
-        guess = self._parse_initial_guess(
-            x0_value=x0_vec,
-            initial_guess=initial_guess,
-        )
-
-        guess = self._clip_initial_guess_to_bounds(
-            guess,
-            x_min=x_min_vec,
-            x_max=x_max_vec,
-            u_min=u_min_vec,
-            u_max=u_max_vec,
-        )
+        # ---------------------------------------------------------------------
+        # Parameter:
+        #   P = p_ref = [p_left_ref; p_right_ref] ∈ R6
+        # ---------------------------------------------------------------------
+        P = ca.MX.sym("P", 6)
+        p_ref = P
 
         # ---------------------------------------------------------------------
         # Weight matrices
@@ -418,9 +427,9 @@ class FastDualEEOCP:
         # NLP containers
         # ---------------------------------------------------------------------
         w: list[ca.MX] = []
-        w0: list[float] = []
-        lbw: list[float] = []
-        ubw: list[float] = []
+        base_w0: list[float] = []
+        base_lbw: list[float] = []
+        base_ubw: list[float] = []
 
         g: list[ca.MX] = []
         lbg: list[float] = []
@@ -441,9 +450,9 @@ class FastDualEEOCP:
         Tf = ca.MX.sym("Tf")
         w.append(Tf)
 
-        w0.append(float(guess.tf))
-        lbw.append(float(cfg.tf_min))
-        ubw.append(float(cfg.tf_max))
+        base_w0.append(float(cfg.tf_init))
+        base_lbw.append(float(cfg.tf_min))
+        base_ubw.append(float(cfg.tf_max))
 
         index_map["Tf"] = (current_index, current_index + 1)
         current_index += 1
@@ -463,15 +472,13 @@ class FastDualEEOCP:
             X.append(Xk)
             w.append(Xk)
 
-            if k == 0:
-                # Initial state enforced as variable bounds.
-                lbw.extend(x0_vec.tolist())
-                ubw.extend(x0_vec.tolist())
-                w0.extend(x0_vec.tolist())
-            else:
-                lbw.extend(x_min_vec.tolist())
-                ubw.extend(x_max_vec.tolist())
-                w0.extend(guess.X_nodes[k].tolist())
+            # X0 is NOT fixed here.
+            # It will be fixed in solve_stage(...) by setting:
+            #   lbx[X0_slice] = x0_stage
+            #   ubx[X0_slice] = x0_stage
+            base_lbw.extend(x_min_vec.tolist())
+            base_ubw.extend(x_max_vec.tolist())
+            base_w0.extend(np.zeros(self.nx, dtype=float).tolist())
 
             index_map["X_nodes"].append(
                 (current_index, current_index + self.nx)
@@ -488,9 +495,9 @@ class FastDualEEOCP:
             U.append(Uk)
             w.append(Uk)
 
-            lbw.extend(u_min_vec.tolist())
-            ubw.extend(u_max_vec.tolist())
-            w0.extend(guess.U_nodes[k].tolist())
+            base_lbw.extend(u_min_vec.tolist())
+            base_ubw.extend(u_max_vec.tolist())
+            base_w0.extend(np.zeros(self.nu, dtype=float).tolist())
 
             index_map["U_nodes"].append(
                 (current_index, current_index + self.nu)
@@ -583,6 +590,7 @@ class FastDualEEOCP:
             "x": w_cat,
             "f": J,
             "g": g_cat,
+            "p": P,
         }
 
         self.solver = ca.nlpsol(
@@ -601,14 +609,10 @@ class FastDualEEOCP:
             "nx": self.nx,
             "method": "explicit_hermite_simpson",
             "collision_enabled": False,
-            "tf_init": float(guess.tf),
+            "parameter_dim": 6,
             "tf_min": float(cfg.tf_min),
             "tf_max": float(cfg.tf_max),
             "time_weight": float(cfg.time_weight),
-            "left_ee_target": left_target.copy(),
-            "right_ee_target": right_target.copy(),
-            "p_ref": p_ref_np.copy(),
-            "x0_value": x0_vec.copy(),
             "x_min": x_min_vec.copy(),
             "x_max": x_max_vec.copy(),
             "u_min": u_min_vec.copy(),
@@ -618,38 +622,155 @@ class FastDualEEOCP:
             "W_v": np.asarray(W_v),
             "W_u": np.asarray(W_u),
             "W_v_f": np.asarray(W_v_f),
-            "w0": np.asarray(w0, dtype=float),
-            "lbw": np.asarray(lbw, dtype=float),
-            "ubw": np.asarray(ubw, dtype=float),
+            "base_w0": np.asarray(base_w0, dtype=float),
+            "base_lbw": np.asarray(base_lbw, dtype=float),
+            "base_ubw": np.asarray(base_ubw, dtype=float),
             "lbg": np.asarray(lbg, dtype=float),
             "ubg": np.asarray(ubg, dtype=float),
             "index_map": index_map,
         }
 
-    def solve(self) -> FastDualEEOCPSolution:
+    def _build_stage_solver_inputs(
+        self,
+        *,
+        x0_value: Sequence[float] | np.ndarray,
+        left_ee_target: Sequence[float] | np.ndarray,
+        right_ee_target: Sequence[float] | np.ndarray,
+        initial_guess: OCPInitialGuessData | None,
+    ) -> dict[str, np.ndarray]:
         """
-        Solve the NLP.
+        Build numeric inputs for one stage solve:
+            w0, lbx, ubx, p
         """
-        if self.solver is None or self.problem_data is None:
-            raise RuntimeError("Call build_problem(...) before solve().")
+        if self.problem_data is None:
+            raise RuntimeError("Call build_problem(...) before solve_stage().")
 
         pd = self.problem_data
 
+        x0_vec = as_vector(x0_value, size=self.nx, name="x0_value")
+
+        left_target = as_vector(left_ee_target, size=3, name="left_ee_target")
+        right_target = as_vector(
+            right_ee_target,
+            size=3,
+            name="right_ee_target",
+        )
+
+        p_ref = np.concatenate([left_target, right_target])
+
+        x_min = pd["x_min"]
+        x_max = pd["x_max"]
+        u_min = pd["u_min"]
+        u_max = pd["u_max"]
+
+        _check_within_bounds(
+            x0_vec,
+            x_min,
+            x_max,
+            name="x0_value",
+        )
+
+        guess = self._parse_initial_guess(
+            x0_value=x0_vec,
+            initial_guess=initial_guess,
+        )
+
+        guess = self._clip_initial_guess_to_bounds(
+            guess,
+            x_min=x_min,
+            x_max=x_max,
+            u_min=u_min,
+            u_max=u_max,
+        )
+
+        w0 = pd["base_w0"].copy()
+        lbx = pd["base_lbw"].copy()
+        ubx = pd["base_ubw"].copy()
+
+        index_map = pd["index_map"]
+
+        # Time initial guess
+        tf_slice = index_map["Tf"]
+        w0[tf_slice[0] : tf_slice[1]] = guess.tf
+
+        # State initial guess
+        for k, sl in enumerate(index_map["X_nodes"]):
+            w0[sl[0] : sl[1]] = guess.X_nodes[k]
+
+        # Control initial guess
+        for k, sl in enumerate(index_map["U_nodes"]):
+            w0[sl[0] : sl[1]] = guess.U_nodes[k]
+
+        # Fix X0 using lbx/ubx.
+        x0_slice = index_map["X_nodes"][0]
+        lbx[x0_slice[0] : x0_slice[1]] = x0_vec
+        ubx[x0_slice[0] : x0_slice[1]] = x0_vec
+        w0[x0_slice[0] : x0_slice[1]] = x0_vec
+
+        return {
+            "w0": w0,
+            "lbx": lbx,
+            "ubx": ubx,
+            "p": p_ref,
+            "left_ee_target": left_target,
+            "right_ee_target": right_target,
+            "p_ref": p_ref,
+            "x0_value": x0_vec,
+        }
+
+    def solve_stage(
+        self,
+        *,
+        x0_value: Sequence[float] | np.ndarray,
+        left_ee_target: Sequence[float] | np.ndarray,
+        right_ee_target: Sequence[float] | np.ndarray,
+        initial_guess: OCPInitialGuessData | None = None,
+    ) -> FastDualEEOCPSolution:
+        """
+        Solve one OCP stage.
+
+        This does NOT rebuild the solver.
+
+        Per-stage inputs:
+            x0_value:
+                Fixed initial state, applied by lbx/ubx on X0.
+
+            left_ee_target, right_ee_target:
+                Target positions in pelvis/base frame.
+                Passed as parameter p = [left; right].
+
+            initial_guess:
+                Warm-start for this stage.
+        """
+        if self.solver is None or self.problem_data is None:
+            raise RuntimeError("Call build_problem(...) before solve_stage().")
+
+        stage_inputs = self._build_stage_solver_inputs(
+            x0_value=x0_value,
+            left_ee_target=left_ee_target,
+            right_ee_target=right_ee_target,
+            initial_guess=initial_guess,
+        )
+
         sol = self.solver(
-            x0=pd["w0"],
-            lbx=pd["lbw"],
-            ubx=pd["ubw"],
-            lbg=pd["lbg"],
-            ubg=pd["ubg"],
+            x0=stage_inputs["w0"],
+            lbx=stage_inputs["lbx"],
+            ubx=stage_inputs["ubx"],
+            lbg=self.problem_data["lbg"],
+            ubg=self.problem_data["ubg"],
+            p=stage_inputs["p"],
         )
 
         self.solution = sol
+        self.last_stage_data = stage_inputs
 
-        return self.extract_solution(sol)
+        return self.extract_solution(sol, stage_data=stage_inputs)
 
     def extract_solution(
         self,
         sol: dict[str, Any] | None = None,
+        *,
+        stage_data: dict[str, np.ndarray] | None = None,
     ) -> FastDualEEOCPSolution:
         """
         Parse NLP solution into trajectories.
@@ -661,6 +782,11 @@ class FastDualEEOCP:
             if self.solution is None:
                 raise RuntimeError("No solution available.")
             sol = self.solution
+
+        if stage_data is None:
+            if self.last_stage_data is None:
+                raise RuntimeError("No stage_data available.")
+            stage_data = self.last_stage_data
 
         w_opt = np.asarray(sol["x"], dtype=float).reshape(-1)
 
@@ -696,6 +822,9 @@ class FastDualEEOCP:
             U_nodes=U_nodes,
             q_nodes=q_nodes,
             v_nodes=v_nodes,
+            left_ee_target=stage_data["left_ee_target"].copy(),
+            right_ee_target=stage_data["right_ee_target"].copy(),
+            p_ref=stage_data["p_ref"].copy(),
             raw_solution=sol,
         )
 
@@ -703,9 +832,12 @@ class FastDualEEOCP:
         """
         Print compact OCP summary.
         """
-        print("===== FAST DUAL-EE OCP =====")
+        print("===== FAST MULTI-STAGE DUAL-EE OCP =====")
         print("method              : explicit Hermite-Simpson")
         print("collision_enabled   : False")
+        print("build_once          : True")
+        print("parameter           : p_ref ∈ R6")
+        print("X0 handling         : fixed by lbx/ubx per stage")
         print(f"N                   : {self.N}")
         print(f"num_nodes           : {self.num_nodes}")
         print(f"nq                  : {self.nq}")
@@ -716,14 +848,12 @@ class FastDualEEOCP:
         print(f"solver_options      : {self.solver_options}")
 
         if self.problem_data is not None:
-            print(f"tf_init             : {self.problem_data['tf_init']}")
             print(f"tf_min              : {self.problem_data['tf_min']}")
             print(f"tf_max              : {self.problem_data['tf_max']}")
             print(f"time_weight         : {self.problem_data['time_weight']}")
-            print(f"left_ee_target      : {self.problem_data['left_ee_target']}")
-            print(f"right_ee_target     : {self.problem_data['right_ee_target']}")
-            print(f"num_decision_vars   : {len(self.problem_data['w0'])}")
+            print(f"num_decision_vars   : {len(self.problem_data['base_w0'])}")
             print(f"num_constraints     : {len(self.problem_data['lbg'])}")
+            print(f"parameter_dim       : {self.problem_data['parameter_dim']}")
 
         if self.solution is not None:
             print(f"objective_opt       : {float(self.solution['f'])}")
