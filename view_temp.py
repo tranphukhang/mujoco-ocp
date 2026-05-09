@@ -28,7 +28,7 @@ def main():
     parser.add_argument(
         "--xml",
         type=str,
-        default="assets/g1_gripper/G1_with_gripper.xml",
+        default="assets/unitree_g1/g1_fixed_base.xml",
         help="Path to MuJoCo XML file.",
     )
     parser.add_argument(
