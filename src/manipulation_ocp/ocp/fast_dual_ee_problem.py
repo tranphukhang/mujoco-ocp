@@ -20,9 +20,6 @@ from manipulation_ocp.ocp.costs import (
     build_dual_ee_stage_cost,
     build_dual_ee_terminal_cost,
 )
-from manipulation_ocp.ocp.direct_collocation import (
-    compute_hermite_simpson_interval,
-)
 from manipulation_ocp.pinocchio.limits import (
     get_effort_limits,
     get_position_limits,
@@ -200,6 +197,10 @@ class FastDualEEOCP:
 
     Dynamics:
         xdot = f(x, u) = [v; ABA(q, v, tau)]
+
+    Graph optimization:
+        Node dynamics and node stage costs are precomputed once and reused
+        across neighboring intervals.
     """
 
     def __init__(
@@ -506,8 +507,52 @@ class FastDualEEOCP:
 
         # ---------------------------------------------------------------------
         # Dynamics constraints + Simpson stage cost
+        #
+        # Optimization:
+        #   Hermite-Simpson needs node dynamics and midpoint dynamics.
+        #
+        #   Naive construction calls node dynamics repeatedly:
+        #       interval k     uses f(X[k+1], U[k+1])
+        #       interval k + 1 uses f(X[k+1], U[k+1]) again
+        #
+        #   Here node dynamics is computed once:
+        #       F_nodes[k] = f_dyn(X[k], U[k])
+        #
+        #   For N intervals:
+        #       old dynamics calls = 3N
+        #       new dynamics calls = (N + 1) + N = 2N + 1
+        #
+        #   For N = 20:
+        #       60 -> 41 calls
+        #
+        #   Node stage costs are also computed once:
+        #       L_nodes[k] = L(X[k], U[k])
         # ---------------------------------------------------------------------
         f_dyn = self.dynamics.explicit_dynamics_fn
+
+        # Precompute dynamics at all state/control nodes.
+        F_nodes: list[ca.MX] = []
+
+        for k in range(self.num_nodes):
+            F_nodes.append(f_dyn(X[k], U[k]))
+
+        # Precompute stage cost at all state/control nodes.
+        L_nodes: list[ca.MX] = []
+
+        for k in range(self.num_nodes):
+            L_nodes.append(
+                build_dual_ee_stage_cost(
+                    x=X[k],
+                    u=U[k],
+                    kinematics=self.kinematics,
+                    p_ref=p_ref,
+                    W_ee=W_ee,
+                    W_v=W_v,
+                    W_u=W_u,
+                    nq=self.nq,
+                    nv=self.nv,
+                )
+            )
 
         for k in range(cfg.n_intervals):
             xk = X[k]
@@ -516,46 +561,29 @@ class FastDualEEOCP:
             uk = U[k]
             ukp1 = U[k + 1]
 
-            defect, xc, uc, _, _, _ = compute_hermite_simpson_interval(
-                f_dyn=f_dyn,
-                xk=xk,
-                xk_next=xkp1,
-                uk=uk,
-                uk_next=ukp1,
-                h=h,
+            fk = F_nodes[k]
+            fkp1 = F_nodes[k + 1]
+
+            uc = 0.5 * (uk + ukp1)
+
+            xc = 0.5 * (xk + xkp1) + (h / 8.0) * (fk - fkp1)
+
+            fc = f_dyn(xc, uc)
+
+            defect = xkp1 - xk - (h / 6.0) * (
+                fk + 4.0 * fc + fkp1
             )
 
             g.append(defect)
             lbg.extend(np.zeros(self.nx).tolist())
             ubg.extend(np.zeros(self.nx).tolist())
 
-            Lk = build_dual_ee_stage_cost(
-                x=xk,
-                u=uk,
-                kinematics=self.kinematics,
-                p_ref=p_ref,
-                W_ee=W_ee,
-                W_v=W_v,
-                W_u=W_u,
-                nq=self.nq,
-                nv=self.nv,
-            )
+            Lk = L_nodes[k]
+            Lkp1 = L_nodes[k + 1]
 
             Lc = build_dual_ee_stage_cost(
                 x=xc,
                 u=uc,
-                kinematics=self.kinematics,
-                p_ref=p_ref,
-                W_ee=W_ee,
-                W_v=W_v,
-                W_u=W_u,
-                nq=self.nq,
-                nv=self.nv,
-            )
-
-            Lkp1 = build_dual_ee_stage_cost(
-                x=xkp1,
-                u=ukp1,
                 kinematics=self.kinematics,
                 p_ref=p_ref,
                 W_ee=W_ee,
@@ -628,6 +656,14 @@ class FastDualEEOCP:
             "lbg": np.asarray(lbg, dtype=float),
             "ubg": np.asarray(ubg, dtype=float),
             "index_map": index_map,
+            "graph_optimization": {
+                "reuse_node_dynamics": True,
+                "reuse_node_stage_cost": True,
+                "node_dynamics_calls": self.num_nodes,
+                "midpoint_dynamics_calls": cfg.n_intervals,
+                "total_dynamics_calls": self.num_nodes + cfg.n_intervals,
+                "naive_dynamics_calls": 3 * cfg.n_intervals,
+            },
         }
 
     def _build_stage_solver_inputs(
@@ -854,6 +890,26 @@ class FastDualEEOCP:
             print(f"num_decision_vars   : {len(self.problem_data['base_w0'])}")
             print(f"num_constraints     : {len(self.problem_data['lbg'])}")
             print(f"parameter_dim       : {self.problem_data['parameter_dim']}")
+
+            graph_opt = self.problem_data.get("graph_optimization", None)
+            if graph_opt is not None:
+                print("graph_optimization  :")
+                print(
+                    "  reuse_node_dynamics    : "
+                    f"{graph_opt['reuse_node_dynamics']}"
+                )
+                print(
+                    "  reuse_node_stage_cost  : "
+                    f"{graph_opt['reuse_node_stage_cost']}"
+                )
+                print(
+                    "  dynamics_calls         : "
+                    f"{graph_opt['total_dynamics_calls']}"
+                )
+                print(
+                    "  naive_dynamics_calls   : "
+                    f"{graph_opt['naive_dynamics_calls']}"
+                )
 
         if self.solution is not None:
             print(f"objective_opt       : {float(self.solution['f'])}")

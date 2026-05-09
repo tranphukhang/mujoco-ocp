@@ -14,7 +14,7 @@ def quadratic_cost(
     """
     Weighted quadratic cost:
 
-        error^T W error
+        error.T @ W @ error
     """
     return ca.mtimes([error.T, W, error])
 
@@ -38,7 +38,7 @@ def build_dual_ee_stage_cost(
     x: ca.MX,
     u: ca.MX,
     kinematics: CasadiPinocchioKinematics,
-    p_ref: ca.DM,
+    p_ref,
     W_ee: ca.DM,
     W_v: ca.DM,
     W_u: ca.DM,
@@ -53,12 +53,21 @@ def build_dual_ee_stage_cost(
           + ||v||^2_W_v
           + ||u||^2_W_u
 
-    where:
-        p(q) = [p_left(q); p_right(q)] ∈ R6
-    """
-    _, v = split_state(x, nq=nq, nv=nv)
+    Important:
+        p(q) depends only on q, not on full x = [q; v].
 
-    p_pair = kinematics.dual_ee_position_x_fn(x)
+    Therefore this function uses:
+        kinematics.dual_ee_position_fn(q)
+
+    instead of:
+        kinematics.dual_ee_position_x_fn(x)
+
+    This keeps the CasADi graph smaller and makes the dependency structure
+    clearer.
+    """
+    q, v = split_state(x, nq=nq, nv=nv)
+
+    p_pair = kinematics.dual_ee_position_fn(q)
     p_error = p_pair - p_ref
 
     ee_cost = quadratic_cost(p_error, W_ee)
@@ -72,7 +81,7 @@ def build_dual_ee_terminal_cost(
     *,
     x: ca.MX,
     kinematics: CasadiPinocchioKinematics,
-    p_ref: ca.DM,
+    p_ref,
     W_ee_f: ca.DM,
     W_v_f: ca.DM,
     nq: int,
@@ -84,10 +93,13 @@ def build_dual_ee_terminal_cost(
         Phi(x_N)
           = ||p(q_N) - p_ref||^2_W_ee_f
           + ||v_N||^2_W_v_f
-    """
-    _, v = split_state(x, nq=nq, nv=nv)
 
-    p_pair = kinematics.dual_ee_position_x_fn(x)
+    Important:
+        EE position only depends on q_N, not on v_N.
+    """
+    q, v = split_state(x, nq=nq, nv=nv)
+
+    p_pair = kinematics.dual_ee_position_fn(q)
     p_error = p_pair - p_ref
 
     ee_terminal_cost = quadratic_cost(p_error, W_ee_f)
