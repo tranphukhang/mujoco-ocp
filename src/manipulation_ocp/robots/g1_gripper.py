@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 import mujoco
 
@@ -62,7 +63,7 @@ ACTIVE_G1_JOINT_NAMES: tuple[str, ...] = (
 # =============================================================================
 # These joints exist in MuJoCo qpos/qvel, but they are not treated as
 # independent OCP coordinates. Each gripper is represented in OCP by one
-# reduced opening coordinate.
+# normalized command/opening coordinate in [0, 1].
 
 LEFT_GRIPPER_JOINT_NAMES: tuple[str, ...] = (
     "left_2f85_left_driver_joint",
@@ -99,7 +100,8 @@ MUJOCO_FULL_JOINT_NAMES: tuple[str, ...] = (
 # Important:
 # - These are MuJoCo XML actuator names.
 # - For G1, XML actuators are position actuators.
-# - These are used for MuJoCo replay/viewer, not as OCP torque inputs.
+# - For Robotiq, XML actuator ctrl is a command range [0, 255].
+# - These are used for MuJoCo replay/viewer, not directly as OCP torque inputs.
 
 MUJOCO_POSITION_ACTUATOR_NAMES: tuple[str, ...] = ACTIVE_G1_JOINT_NAMES
 
@@ -112,6 +114,80 @@ MUJOCO_ACTUATOR_NAMES: tuple[str, ...] = (
     MUJOCO_POSITION_ACTUATOR_NAMES
     + MUJOCO_GRIPPER_ACTUATOR_NAMES
 )
+
+
+# =============================================================================
+# Gripper command normalization
+# =============================================================================
+# MuJoCo Robotiq actuator:
+#   ctrlrange = [0, 255]
+#
+# OCP reduced gripper coordinate:
+#   left_gripper_opening, right_gripper_opening in [0, 1]
+#
+# Convention:
+#   0.0 = open / minimum command
+#   1.0 = close / maximum command
+
+GRIPPER_COMMAND_MIN = 0.0
+GRIPPER_COMMAND_MAX = 1.0
+
+MUJOCO_GRIPPER_CTRL_MIN = 0.0
+MUJOCO_GRIPPER_CTRL_MAX = 255.0
+
+GRIPPER_COMMAND_TO_MUJOCO_CTRL_SCALE = (
+    MUJOCO_GRIPPER_CTRL_MAX - MUJOCO_GRIPPER_CTRL_MIN
+)
+
+GRIPPER_COMMAND_TO_MUJOCO_CTRL_OFFSET = MUJOCO_GRIPPER_CTRL_MIN
+
+OCP_GRIPPER_COORDINATE_LIMITS: Mapping[str, tuple[float, float]] = {
+    "left_gripper_opening": (GRIPPER_COMMAND_MIN, GRIPPER_COMMAND_MAX),
+    "right_gripper_opening": (GRIPPER_COMMAND_MIN, GRIPPER_COMMAND_MAX),
+}
+
+MUJOCO_GRIPPER_CTRL_LIMITS: Mapping[str, tuple[float, float]] = {
+    "left_2f85_fingers_actuator": (
+        MUJOCO_GRIPPER_CTRL_MIN,
+        MUJOCO_GRIPPER_CTRL_MAX,
+    ),
+    "right_2f85_fingers_actuator": (
+        MUJOCO_GRIPPER_CTRL_MIN,
+        MUJOCO_GRIPPER_CTRL_MAX,
+    ),
+}
+
+
+def gripper_command_to_mujoco_ctrl(command: float) -> float:
+    """
+    Convert normalized OCP gripper command in [0, 1] to MuJoCo ctrl in [0, 255].
+    """
+    if command < GRIPPER_COMMAND_MIN or command > GRIPPER_COMMAND_MAX:
+        raise ValueError(
+            f"Gripper command must be in "
+            f"[{GRIPPER_COMMAND_MIN}, {GRIPPER_COMMAND_MAX}], got {command}"
+        )
+
+    return (
+        GRIPPER_COMMAND_TO_MUJOCO_CTRL_OFFSET
+        + GRIPPER_COMMAND_TO_MUJOCO_CTRL_SCALE * command
+    )
+
+
+def mujoco_ctrl_to_gripper_command(ctrl: float) -> float:
+    """
+    Convert MuJoCo gripper ctrl in [0, 255] to normalized OCP command in [0, 1].
+    """
+    if ctrl < MUJOCO_GRIPPER_CTRL_MIN or ctrl > MUJOCO_GRIPPER_CTRL_MAX:
+        raise ValueError(
+            f"MuJoCo gripper ctrl must be in "
+            f"[{MUJOCO_GRIPPER_CTRL_MIN}, {MUJOCO_GRIPPER_CTRL_MAX}], got {ctrl}"
+        )
+
+    return (
+        (ctrl - GRIPPER_COMMAND_TO_MUJOCO_CTRL_OFFSET)
+        / GRIPPER_COMMAND_TO_MUJOCO_CTRL_SCALE
+    )
 
 
 # =============================================================================
@@ -152,6 +228,13 @@ OCP_COORDINATE_NAMES: tuple[str, ...] = (
     + OCP_GRIPPER_COORDINATE_NAMES
 )
 
+OCP_DEFAULT_VELOCITY_LIMIT: tuple[float, float] = (-10.0, 10.0)
+
+OCP_VELOCITY_LIMITS: Mapping[str, tuple[float, float]] = {
+    name: OCP_DEFAULT_VELOCITY_LIMIT
+    for name in OCP_COORDINATE_NAMES
+}
+
 OCP_G1_TORQUE_NAMES: tuple[str, ...] = tuple(
     f"{joint_name}_torque"
     for joint_name in OCP_G1_JOINT_NAMES
@@ -168,6 +251,7 @@ OCP_CONTROL_NAMES: tuple[str, ...] = (
 )
 
 OUTPUT_COORDINATE_NAMES: tuple[str, ...] = OCP_COORDINATE_NAMES
+
 OUTPUT_VELOCITY_NAMES: tuple[str, ...] = tuple(
     f"{name}_velocity"
     for name in OUTPUT_COORDINATE_NAMES
@@ -181,7 +265,7 @@ OUTPUT_VELOCITY_NAMES: tuple[str, ...] = tuple(
 LEFT_EE_SITE_NAME = "left_2f85_grip_site"
 RIGHT_EE_SITE_NAME = "right_2f85_grip_site"
 
-EE_SITE_NAMES: dict[str, str] = {
+EE_SITE_NAMES: Mapping[str, str] = {
     "left": LEFT_EE_SITE_NAME,
     "right": RIGHT_EE_SITE_NAME,
 }
@@ -225,6 +309,12 @@ class G1GripperConfig:
     mujoco_gripper_actuator_names: tuple[str, ...]
     mujoco_actuator_names: tuple[str, ...]
 
+    # Gripper command mapping
+    ocp_gripper_coordinate_limits: Mapping[str, tuple[float, float]]
+    mujoco_gripper_ctrl_limits: Mapping[str, tuple[float, float]]
+    gripper_command_to_mujoco_ctrl_scale: float
+    gripper_command_to_mujoco_ctrl_offset: float
+
     # OCP reduced model names
     ocp_g1_joint_names: tuple[str, ...]
     ocp_gripper_coordinate_names: tuple[str, ...]
@@ -232,13 +322,14 @@ class G1GripperConfig:
     ocp_g1_torque_names: tuple[str, ...]
     ocp_gripper_effort_names: tuple[str, ...]
     ocp_control_names: tuple[str, ...]
+    ocp_velocity_limits: Mapping[str, tuple[float, float]]
 
     # Output trajectory names
     output_coordinate_names: tuple[str, ...]
     output_velocity_names: tuple[str, ...]
 
     # End-effector sites
-    ee_site_names: dict[str, str]
+    ee_site_names: Mapping[str, str]
 
     # Dimensions
     nq_ocp: int
@@ -263,13 +354,18 @@ G1_GRIPPER_CONFIG = G1GripperConfig(
     mujoco_gripper_actuator_names=MUJOCO_GRIPPER_ACTUATOR_NAMES,
     mujoco_actuator_names=MUJOCO_ACTUATOR_NAMES,
 
+    ocp_gripper_coordinate_limits=OCP_GRIPPER_COORDINATE_LIMITS,
+    mujoco_gripper_ctrl_limits=MUJOCO_GRIPPER_CTRL_LIMITS,
+    gripper_command_to_mujoco_ctrl_scale=GRIPPER_COMMAND_TO_MUJOCO_CTRL_SCALE,
+    gripper_command_to_mujoco_ctrl_offset=GRIPPER_COMMAND_TO_MUJOCO_CTRL_OFFSET,
+
     ocp_g1_joint_names=OCP_G1_JOINT_NAMES,
     ocp_gripper_coordinate_names=OCP_GRIPPER_COORDINATE_NAMES,
     ocp_coordinate_names=OCP_COORDINATE_NAMES,
     ocp_g1_torque_names=OCP_G1_TORQUE_NAMES,
     ocp_gripper_effort_names=OCP_GRIPPER_EFFORT_NAMES,
     ocp_control_names=OCP_CONTROL_NAMES,
-
+    ocp_velocity_limits=OCP_VELOCITY_LIMITS,
     output_coordinate_names=OUTPUT_COORDINATE_NAMES,
     output_velocity_names=OUTPUT_VELOCITY_NAMES,
 
