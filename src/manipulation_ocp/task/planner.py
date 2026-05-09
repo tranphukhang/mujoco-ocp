@@ -11,6 +11,7 @@ from manipulation_ocp.configs.initial_guess import InitialGuessConfig
 from manipulation_ocp.ocp.fast_dual_ee_problem import (
     FastDualEEOCP,
     FastDualEEOCPSolution,
+    OCPInitialGuessData,
     make_initial_guess_data,
 )
 from manipulation_ocp.pinocchio.ik import build_initial_guess_from_dual_ee_targets
@@ -42,13 +43,18 @@ class TaskPlannerConfig:
 
     dt:
         Fixed sampling time for planner output.
-        This should match RL dt. Current target: 0.02 s.
+        This should match the RL/control sampling time.
+        Current target: 0.02 s.
 
     default_gripper_open_command:
         Normalized gripper open command.
 
     default_gripper_close_command:
         Normalized gripper close command.
+
+    raise_on_ocp_failure:
+        If True, planner raises RuntimeError when OCP does not solve
+        successfully.
     """
 
     dt: float = 0.02
@@ -56,7 +62,12 @@ class TaskPlannerConfig:
     default_gripper_open_command: float = 0.0
     default_gripper_close_command: float = 1.0
 
+    raise_on_ocp_failure: bool = True
+
     def validate(self) -> None:
+        if not np.isfinite(self.dt):
+            raise ValueError(f"dt must be finite, got {self.dt}")
+
         if self.dt <= 0.0:
             raise ValueError(f"dt must be > 0, got {self.dt}")
 
@@ -77,20 +88,25 @@ class PickPlaceTaskPlanner:
     """
     Task-level planner for staggered dual-arm manipulation.
 
-    This planner does NOT open MuJoCo viewer.
+    This planner does not open a MuJoCo viewer.
+
     It converts task stages into:
         - OCP solutions
         - resampled OCP q/v/u references at fixed dt
         - smooth gripper command trajectories
         - return-arm joint trajectories
 
-    OCP build-once design:
-        ocp.build_problem() should be called before planner.run(...).
+    Build-once design:
+        The caller must create and build the OCP before constructing or
+        running this planner:
 
-    Then this planner only calls:
-        ocp.solve_stage(...)
+            ocp.build_problem()
 
-    for each motion stage.
+        Then this planner only calls:
+
+            ocp.solve_stage(...)
+
+        for each motion stage.
     """
 
     def __init__(
@@ -103,8 +119,8 @@ class PickPlaceTaskPlanner:
         config: TaskPlannerConfig | None = None,
         ik_config: DualEEIKConfig | None = None,
         initial_guess_config: InitialGuessConfig | None = None,
-        left_gripper_command: float = 0.0,
-        right_gripper_command: float = 0.0,
+        left_gripper_command: float | None = None,
+        right_gripper_command: float | None = None,
     ) -> None:
         if config is None:
             config = TaskPlannerConfig()
@@ -115,6 +131,8 @@ class PickPlaceTaskPlanner:
         self.pin_model = pin_model
         self.pin_data = pin_data
         self.config = config
+
+        self._validate_ocp_is_built()
 
         self.q_initial = as_vector(q_initial, size=ocp.nq, name="q_initial")
 
@@ -127,8 +145,16 @@ class PickPlaceTaskPlanner:
                 dt=config.dt,
             )
 
+        self._validate_initial_guess_config(initial_guess_config)
+
         self.ik_config = ik_config
         self.initial_guess_config = initial_guess_config
+
+        if left_gripper_command is None:
+            left_gripper_command = config.default_gripper_open_command
+
+        if right_gripper_command is None:
+            right_gripper_command = config.default_gripper_open_command
 
         self.left_gripper_command = float(left_gripper_command)
         self.right_gripper_command = float(right_gripper_command)
@@ -151,8 +177,47 @@ class PickPlaceTaskPlanner:
         self.left_home_ee = np.asarray(home_ee["left"], dtype=float).reshape(3)
         self.right_home_ee = np.asarray(home_ee["right"], dtype=float).reshape(3)
 
+    def _validate_ocp_is_built(self) -> None:
+        """
+        Ensure OCP graph/solver has already been built.
+
+        The planner is intentionally not responsible for building the OCP.
+        This avoids accidental rebuilds inside reset(), run(), or each stage.
+        """
+        if self.ocp.problem_data is None or self.ocp.solver is None:
+            raise RuntimeError(
+                "OCP is not built. Call ocp.build_problem() before "
+                "creating/running PickPlaceTaskPlanner."
+            )
+
+    def _validate_initial_guess_config(
+        self,
+        initial_guess_config: InitialGuessConfig,
+    ) -> None:
+        """
+        Keep IK/RNEA initial guess mesh consistent with OCP/planner mesh.
+        """
+        n_intervals = getattr(initial_guess_config, "n_intervals", None)
+        dt = getattr(initial_guess_config, "dt", None)
+
+        if n_intervals is not None and n_intervals != self.ocp.config.n_intervals:
+            raise ValueError(
+                "initial_guess_config.n_intervals must match "
+                "ocp.config.n_intervals. "
+                f"Got {n_intervals} and {self.ocp.config.n_intervals}."
+            )
+
+        if dt is not None and abs(float(dt) - self.config.dt) > 1e-12:
+            raise ValueError(
+                "initial_guess_config.dt must match planner config dt. "
+                f"Got {dt} and {self.config.dt}."
+            )
+
     @staticmethod
     def _validate_gripper_command(command: float, *, name: str) -> None:
+        if not np.isfinite(command):
+            raise ValueError(f"{name} must be finite, got {command}")
+
         if command < 0.0 or command > 1.0:
             raise ValueError(f"{name} must be in [0, 1], got {command}")
 
@@ -162,6 +227,28 @@ class PickPlaceTaskPlanner:
         Actions that require an OCP solve.
         """
         return isinstance(action, (ReachAction, LiftAction))
+
+    def _check_ocp_solution(
+        self,
+        solution: FastDualEEOCPSolution,
+        *,
+        step_name: str,
+    ) -> None:
+        """
+        Check one OCP solution before resampling it.
+        """
+        if solution.success:
+            return
+
+        message = (
+            f"OCP failed at step {step_name!r}. "
+            f"status={solution.status!r}, objective={solution.objective}"
+        )
+
+        if self.config.raise_on_ocp_failure:
+            raise RuntimeError(message)
+
+        print(f"[warning] {message}")
 
     def _get_current_ee_positions(
         self,
@@ -202,7 +289,7 @@ class PickPlaceTaskPlanner:
         Convert one arm action into an EE target for the dual-EE OCP.
 
         For non-motion actions, the target is used as a hold target when the
-        other arm needs to move.
+        other arm moves.
         """
         side = action.side
 
@@ -242,7 +329,7 @@ class PickPlaceTaskPlanner:
         x0_value: np.ndarray,
         left_target: np.ndarray,
         right_target: np.ndarray,
-    ):
+    ) -> OCPInitialGuessData:
         """
         Build IK/RNEA warm start for one OCP stage.
         """
@@ -293,7 +380,7 @@ class PickPlaceTaskPlanner:
         )
 
         if not needs_motion:
-            return x_current, None, None
+            return x_current.copy(), None, None
 
         current_ee = self._get_current_ee_positions(x_current)
 
@@ -320,22 +407,34 @@ class PickPlaceTaskPlanner:
             initial_guess=initial_guess,
         )
 
+        self._check_ocp_solution(
+            solution,
+            step_name=step.name,
+        )
+
         reference = resample_ocp_solution_to_dt(
             solution=solution,
             dt=self.config.dt,
             include_u=True,
         )
 
-        # The fixed-dt reference is the official output of the planner.
-        # Therefore the next stage starts from the final resampled state.
-        x_next = np.concatenate(
+        x_next = self._state_from_resampled_reference(reference)
+
+        return x_next, solution, reference
+
+    def _state_from_resampled_reference(
+        self,
+        reference: ResampledTrajectory,
+    ) -> np.ndarray:
+        """
+        Use the final fixed-dt reference sample as the next planner state.
+        """
+        return np.concatenate(
             [
                 reference.q[-1],
                 reference.v[-1],
             ]
         )
-
-        return x_next, solution, reference
 
     def _build_gripper_traj_if_needed(
         self,
@@ -402,7 +501,7 @@ class PickPlaceTaskPlanner:
             return_actions.append(step.right)
 
         if not return_actions:
-            return x_current, None, None
+            return x_current.copy(), None, None
 
         q_segments: list[np.ndarray] = []
         v_segments: list[np.ndarray] = []
@@ -421,7 +520,7 @@ class PickPlaceTaskPlanner:
             )
 
             if q_segments:
-                # Avoid duplicate boundary node.
+                # Avoid duplicate boundary node when concatenating segments.
                 q_segments.append(q_traj[1:])
                 v_segments.append(v_traj[1:])
             else:
@@ -450,7 +549,10 @@ class PickPlaceTaskPlanner:
             3. Resample OCP q/v/u to fixed dt.
             4. Apply return-arm trajectory if any.
 
-        MuJoCo executor can later decide how to visualize these outputs.
+        Note:
+            If a gripper action should happen after a reach motion, represent it
+            as a separate ParallelArmStep. This keeps the temporal order
+            explicit.
         """
         x_start = as_vector(x_current, size=self.ocp.nx, name="x_current")
         x_work = x_start.copy()
