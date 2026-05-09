@@ -31,6 +31,7 @@ from manipulation_ocp.task.stages import (
     ReachAction,
     ReturnArmAction,
 )
+from manipulation_ocp.utils.paths import G1_GRIPPER_SCENE_XML
 
 
 def build_default_q0() -> np.ndarray:
@@ -157,6 +158,8 @@ def print_plan_summary(result) -> None:
             print("ocp objective:", stage.ocp_solution.objective)
             print("ocp tf:", stage.ocp_solution.tf)
             print("ocp h:", stage.ocp_solution.h)
+            print("left target:", stage.ocp_solution.left_ee_target)
+            print("right target:", stage.ocp_solution.right_ee_target)
 
         print("has ocp reference:", stage.has_ocp_reference)
 
@@ -206,7 +209,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--viewer",
         action="store_true",
-        help="Open MuJoCo passive viewer.",
+        help="Open MuJoCo GUI before OCP build/solve.",
     )
 
     parser.add_argument(
@@ -218,7 +221,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--realtime",
         action="store_true",
-        help="Replay in real time. By default headless replay is not realtime.",
+        help="Replay in real time. Viewer mode implies realtime.",
     )
 
     parser.add_argument(
@@ -227,7 +230,64 @@ def parse_args() -> argparse.Namespace:
         help="Do not print detailed per-stage summary.",
     )
 
+    parser.add_argument(
+        "--no-ee-path",
+        action="store_true",
+        help="Disable left/right end-effector path drawing.",
+    )
+
+    parser.add_argument(
+        "--no-command-points",
+        action="store_true",
+        help="Disable command target point drawing.",
+    )
+
+    parser.add_argument(
+        "--no-ee-points",
+        action="store_true",
+        help="Disable current EE point drawing.",
+    )
+
     return parser.parse_args()
+
+
+def build_executor(
+    *,
+    show_viewer: bool,
+    realtime: bool,
+    draw_ee_path: bool,
+    draw_command_points: bool,
+    draw_current_ee_points: bool,
+) -> MujocoTaskExecutor:
+    """
+    Build MuJoCo executor from assets/g1_gripper/scene.xml.
+    """
+    print(f"Loading MuJoCo scene: {G1_GRIPPER_SCENE_XML}")
+
+    return MujocoTaskExecutor.from_xml_path(
+        G1_GRIPPER_SCENE_XML,
+        config=MujocoTaskExecutorConfig(
+            show_viewer=show_viewer,
+            realtime=realtime,
+            reset_keyframe="home",
+            pause_between_stages=True,
+            stage_pause_time=0.25,
+            hold_final_time=0.5,
+            print_stage=True,
+            draw_ee_path=draw_ee_path,
+            draw_command_points=draw_command_points,
+            draw_current_ee_points=draw_current_ee_points,
+
+            # Smaller visual markers.
+            ee_path_line_width=0.1,
+            current_ee_point_size=0.005,
+            command_point_size=0.005,
+
+            # OCP command targets are in pelvis/base frame.
+            command_points_are_in_base_frame=True,
+            command_frame_body_name="pelvis",
+        ),
+    )
 
 
 def main() -> None:
@@ -235,99 +295,151 @@ def main() -> None:
 
     dt = 0.02
 
-    print("Loading Pinocchio/OCP model...")
-    pin_model, pin_data = load_model_and_data(PINOCCHIO_MODEL_XML)
+    executor: MujocoTaskExecutor | None = None
+    viewer_context = None
+    viewer = None
 
-    print("Building CasADi dynamics/kinematics...")
-    dyn = build_casadi_pinocchio_dynamics(pin_model, name_prefix="g1")
-    kin = build_casadi_pinocchio_kinematics(pin_model, name_prefix="g1")
+    draw_ee_path = not args.no_ee_path
+    draw_command_points = not args.no_command_points
+    draw_current_ee_points = not args.no_ee_points
 
-    ocp_cfg = FastDualEEOCPConfig(
-        n_intervals=20,
-        tf_init=0.4,
-        tf_min=0.4,
-        tf_max=6.0,
-    )
-
-    solver_options = {
-        "ipopt.print_level": 0,
-        "print_time": True,
-        "ipopt.max_iter": 100,
-        "ipopt.tol": 1e-4,
-        "ipopt.acceptable_tol": 1e-3,
-        "ipopt.acceptable_iter": 5,
-        "expand": True,
-    }
-
-    ocp = FastDualEEOCP(
-        dyn,
-        kin,
-        config=ocp_cfg,
-        solver_options=solver_options,
-    )
-
-    print("Building OCP problem...")
-    t0 = time.perf_counter()
-    ocp.build_problem()
-    print("ocp build time:", time.perf_counter() - t0)
-
-    q0 = build_default_q0()
-    v0 = np.zeros(17)
-    x0 = np.concatenate([q0, v0])
-
-    ee_home = get_ee_positions(pin_model, pin_data, q0)
-    left_home = np.asarray(ee_home["left"], dtype=float).reshape(3)
-    right_home = np.asarray(ee_home["right"], dtype=float).reshape(3)
-
-    planner = PickPlaceTaskPlanner(
-        ocp=ocp,
-        pin_model=pin_model,
-        pin_data=pin_data,
-        q_initial=q0,
-        config=TaskPlannerConfig(dt=dt),
-        ik_config=DualEEIKConfig(verbose=False),
-        initial_guess_config=InitialGuessConfig(n_intervals=20, dt=dt),
-    )
-
-    steps = build_demo_steps(
-        left_home=left_home,
-        right_home=right_home,
-    )
-
-    print("Running task planner...")
-    t0 = time.perf_counter()
-    result = planner.run(
-        x0_start=x0,
-        steps=steps,
-    )
-    print("planner run time:", time.perf_counter() - t0)
-
-    if not args.quiet:
-        print_plan_summary(result)
-
-    if args.no_execute:
-        print("")
-        print("play.py planner test OK")
-        return
-
-    print("")
-    print("Executing MuJoCo replay...")
-
-    executor = MujocoTaskExecutor.from_xml_path(
-        config=MujocoTaskExecutorConfig(
+    # Open MuJoCo GUI before OCP build/solve when requested.
+    # This lets the user see the robot at keyframe home while OCP is being
+    # built and solved.
+    if args.viewer or not args.no_execute:
+        executor = build_executor(
             show_viewer=bool(args.viewer),
             realtime=bool(args.realtime or args.viewer),
-            pause_between_stages=True,
-            stage_pause_time=0.25,
-            hold_final_time=0.5,
-            print_stage=True,
-        ),
-    )
+            draw_ee_path=draw_ee_path,
+            draw_command_points=draw_command_points,
+            draw_current_ee_points=draw_current_ee_points,
+        )
 
-    executor.execute_plan(result)
+    if args.viewer:
+        if executor is None:
+            raise RuntimeError("Internal error: executor was not created.")
 
-    print("")
-    print("play.py full pipeline OK")
+        print("Opening MuJoCo GUI before OCP build/solve...")
+        viewer_context = executor.launch_viewer()
+        viewer = viewer_context.__enter__()
+
+        executor._sync_viewer(viewer)
+        executor._hold(viewer=viewer, duration=0.5)
+
+    try:
+        print("Loading Pinocchio/OCP model...")
+        pin_model, pin_data = load_model_and_data(PINOCCHIO_MODEL_XML)
+
+        print("Building CasADi dynamics/kinematics...")
+        dyn = build_casadi_pinocchio_dynamics(pin_model, name_prefix="g1")
+        kin = build_casadi_pinocchio_kinematics(pin_model, name_prefix="g1")
+
+        ocp_cfg = FastDualEEOCPConfig(
+            n_intervals=20,
+            tf_init=0.4,
+            tf_min=0.4,
+            tf_max=6.0,
+        )
+
+        solver_options = {
+            "ipopt.print_level": 0,
+            "print_time": False,
+            "ipopt.max_iter": 100,
+            "ipopt.tol": 1e-4,
+            "ipopt.acceptable_tol": 1e-3,
+            "ipopt.acceptable_iter": 5,
+            "expand": True,
+        }
+
+        ocp = FastDualEEOCP(
+            dyn,
+            kin,
+            config=ocp_cfg,
+            solver_options=solver_options,
+        )
+
+        print("Building OCP problem...")
+        t0 = time.perf_counter()
+        ocp.build_problem()
+        print("ocp build time:", time.perf_counter() - t0)
+
+        if viewer is not None and executor is not None:
+            executor._sync_viewer(viewer)
+
+        q0 = build_default_q0()
+        v0 = np.zeros(17)
+        x0 = np.concatenate([q0, v0])
+
+        ee_home = get_ee_positions(pin_model, pin_data, q0)
+        left_home = np.asarray(ee_home["left"], dtype=float).reshape(3)
+        right_home = np.asarray(ee_home["right"], dtype=float).reshape(3)
+
+        planner = PickPlaceTaskPlanner(
+            ocp=ocp,
+            pin_model=pin_model,
+            pin_data=pin_data,
+            q_initial=q0,
+            config=TaskPlannerConfig(dt=dt),
+            ik_config=DualEEIKConfig(verbose=False),
+            initial_guess_config=InitialGuessConfig(n_intervals=20, dt=dt),
+        )
+
+        steps = build_demo_steps(
+            left_home=left_home,
+            right_home=right_home,
+        )
+
+        print("Running task planner...")
+        t0 = time.perf_counter()
+        result = planner.run(
+            x0_start=x0,
+            steps=steps,
+        )
+        print("planner run time:", time.perf_counter() - t0)
+
+        if not args.quiet:
+            print_plan_summary(result)
+
+        if executor is not None:
+            executor.collect_command_points_from_plan(result)
+            executor._sync_viewer(viewer)
+
+        if args.no_execute:
+            print("")
+            print("play.py planner test OK")
+
+            if viewer is not None and executor is not None:
+                executor.keep_viewer_alive_until_closed(viewer)
+
+            return
+
+        print("")
+        print("Executing MuJoCo replay...")
+
+        if executor is None:
+            executor = build_executor(
+                show_viewer=False,
+                realtime=bool(args.realtime),
+                draw_ee_path=draw_ee_path,
+                draw_command_points=draw_command_points,
+                draw_current_ee_points=draw_current_ee_points,
+            )
+
+        executor.execute_plan(
+            result,
+            viewer=viewer,
+        )
+
+        print("")
+        print("play.py full pipeline OK")
+
+        # Do not automatically close GUI after replay.
+        if viewer is not None:
+            executor.keep_viewer_alive_until_closed(viewer)
+
+    finally:
+        if viewer_context is not None:
+            viewer_context.__exit__(None, None, None)
 
 
 if __name__ == "__main__":

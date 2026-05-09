@@ -22,13 +22,15 @@ from manipulation_ocp.mujoco.state_mapping import (
     get_default_replay_reference_state,
 )
 from manipulation_ocp.robots.g1_gripper import (
+    LEFT_EE_SITE_NAME,
     MUJOCO_GRIPPER_ACTUATOR_NAMES,
     MUJOCO_POSITION_ACTUATOR_NAMES,
-    MUJOCO_REPLAY_XML,
+    RIGHT_EE_SITE_NAME,
     gripper_command_to_mujoco_ctrl,
     validate_mujoco_replay_model,
 )
 from manipulation_ocp.task.stages import StageResult, TaskPlanResult
+from manipulation_ocp.utils.paths import G1_GRIPPER_SCENE_XML
 
 
 @dataclass(frozen=True)
@@ -38,41 +40,12 @@ class MujocoTaskExecutorConfig:
 
     This executor is for visualization/replay, not for OCP solving.
 
-    show_viewer:
-        If True, open MuJoCo passive viewer.
-
-    realtime:
-        If True, sleep between samples using dt.
-
-    dt:
-        Fallback sample time if a stage does not provide time vector.
-
-    reset_keyframe:
-        Optional MuJoCo keyframe name. If None, the executor uses the default
-        replay reference state from state_mapping.py.
-
-    pause_between_stages:
-        If True, hold the viewer briefly between stages.
-
-    stage_pause_time:
-        Pause duration after each stage.
-
-    hold_final_time:
-        Viewer hold duration after the full plan is done.
-
-    set_g1_position_ctrl:
-        If True, also writes G1 position actuator ctrl to q_ocp.
-        The visual replay still primarily uses direct state replay.
-
-    use_model_timestep_substeps:
-        If True, each planner sample is advanced using multiple MuJoCo steps
-        based on model.opt.timestep.
-
-    substeps_per_sample:
-        Optional manual override. If None, computed from dt/model timestep.
-
-    print_stage:
-        If True, print stage names during execution.
+    Defaults:
+        - load assets/g1_gripper/scene.xml
+        - reset to keyframe "home"
+        - draw EE paths
+        - draw current EE points
+        - draw command target points
     """
 
     show_viewer: bool = True
@@ -80,7 +53,8 @@ class MujocoTaskExecutorConfig:
 
     dt: float = 0.02
 
-    reset_keyframe: str | None = None
+    # Reset to keyframe home immediately when loading/resetting MuJoCo.
+    reset_keyframe: str | None = "home"
 
     pause_between_stages: bool = True
     stage_pause_time: float = 0.25
@@ -92,6 +66,63 @@ class MujocoTaskExecutorConfig:
     substeps_per_sample: int | None = None
 
     print_stage: bool = True
+
+    # EE path line.
+    draw_ee_path: bool = True
+    ee_path_max_points: int = 3000
+    ee_path_line_width: float = 0.006
+
+    left_ee_path_rgba: tuple[float, float, float, float] = (
+        0.0,
+        0.75,
+        1.0,
+        1.0,
+    )
+    right_ee_path_rgba: tuple[float, float, float, float] = (
+        1.0,
+        0.45,
+        0.0,
+        1.0,
+    )
+
+    # Current EE point.
+    draw_current_ee_points: bool = True
+    current_ee_point_size: float = 0.018
+
+    left_current_ee_rgba: tuple[float, float, float, float] = (
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+    )
+    right_current_ee_rgba: tuple[float, float, float, float] = (
+        1.0,
+        0.75,
+        0.0,
+        1.0,
+    )
+
+    # Command target points.
+    draw_command_points: bool = True
+    command_point_size: float = 0.022
+
+    left_command_point_rgba: tuple[float, float, float, float] = (
+        0.0,
+        0.2,
+        1.0,
+        1.0,
+    )
+    right_command_point_rgba: tuple[float, float, float, float] = (
+        1.0,
+        0.1,
+        0.0,
+        1.0,
+    )
+
+    # OCP command targets are produced in Pinocchio pelvis/base frame.
+    # MuJoCo viewer.user_scn expects world-frame positions.
+    command_points_are_in_base_frame: bool = True
+    command_frame_body_name: str = "pelvis"
 
     def validate(self) -> None:
         if not np.isfinite(self.dt):
@@ -116,30 +147,48 @@ class MujocoTaskExecutorConfig:
                 f"got {self.substeps_per_sample}"
             )
 
+        if self.ee_path_max_points <= 1:
+            raise ValueError(
+                f"ee_path_max_points must be > 1, got {self.ee_path_max_points}"
+            )
+
+        for name, value in {
+            "ee_path_line_width": self.ee_path_line_width,
+            "current_ee_point_size": self.current_ee_point_size,
+            "command_point_size": self.command_point_size,
+        }.items():
+            if not np.isfinite(value):
+                raise ValueError(f"{name} must be finite, got {value}")
+
+            if value <= 0.0:
+                raise ValueError(f"{name} must be > 0, got {value}")
+
+        if not isinstance(self.command_frame_body_name, str):
+            raise TypeError(
+                "command_frame_body_name must be a string, "
+                f"got {type(self.command_frame_body_name)}"
+            )
+
+        if not self.command_frame_body_name.strip():
+            raise ValueError("command_frame_body_name must be non-empty")
+
 
 class MujocoTaskExecutor:
     """
     Replay a TaskPlanResult in MuJoCo.
 
-    This executor supports:
+    Supports:
         - OCP q/v reference replay
         - return-arm q/v replay
         - smooth gripper command replay
-        - optional MuJoCo passive viewer
-
-    Important:
-        OCP does not optimize gripper joints.
-        Gripper is replayed through MuJoCo gripper actuator controls.
+        - MuJoCo passive viewer
+        - left/right EE path drawing
+        - current EE point drawing
+        - command target point drawing
 
     Replay strategy:
-        G1 upper-body joints are applied by direct state replay using
-        OCP q/v references.
-
-        Gripper command is applied through normalized command trajectories:
-            0.0 = open
-            1.0 = close
-
-        which are converted to MuJoCo ctrl in [0, 255].
+        G1 upper-body joints are applied by direct state replay using OCP q/v.
+        Gripper is replayed through MuJoCo gripper actuator controls.
     """
 
     def __init__(
@@ -178,6 +227,19 @@ class MujocoTaskExecutor:
             MUJOCO_GRIPPER_ACTUATOR_NAMES[1],
         )
 
+        self.left_ee_site_id = self._get_site_id(LEFT_EE_SITE_NAME)
+        self.right_ee_site_id = self._get_site_id(RIGHT_EE_SITE_NAME)
+
+        self.command_frame_body_id = self._get_body_id(
+            self.config.command_frame_body_name,
+        )
+
+        self.left_ee_path: list[np.ndarray] = []
+        self.right_ee_path: list[np.ndarray] = []
+
+        self.left_command_points: list[np.ndarray] = []
+        self.right_command_points: list[np.ndarray] = []
+
         self.left_gripper_command = self._validate_gripper_command(
             left_gripper_command,
             name="left_gripper_command",
@@ -187,12 +249,13 @@ class MujocoTaskExecutor:
             name="right_gripper_command",
         )
 
+        # Reset to keyframe home immediately after load.
         self.reset()
 
     @classmethod
     def from_xml_path(
         cls,
-        xml_path: str | Path = MUJOCO_REPLAY_XML,
+        xml_path: str | Path = G1_GRIPPER_SCENE_XML,
         *,
         config: MujocoTaskExecutorConfig | None = None,
         left_gripper_command: float = 0.0,
@@ -200,7 +263,10 @@ class MujocoTaskExecutor:
         validate_model: bool = True,
     ) -> MujocoTaskExecutor:
         """
-        Load MuJoCo replay model and create executor.
+        Load MuJoCo scene/replay model and create executor.
+
+        Default XML:
+            assets/g1_gripper/scene.xml
         """
         model, data = load_model_and_data(xml_path)
 
@@ -247,9 +313,51 @@ class MujocoTaskExecutor:
     ) -> tuple[int, ...]:
         return tuple(self._get_actuator_id(name) for name in names)
 
+    def _get_site_id(self, name: str) -> int:
+        site_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_SITE,
+            name,
+        )
+
+        if site_id < 0:
+            raise ValueError(f"MuJoCo site not found: {name}")
+
+        return int(site_id)
+
+    def _get_body_id(self, name: str) -> int:
+        body_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            name,
+        )
+
+        if body_id < 0:
+            raise ValueError(f"MuJoCo body not found: {name}")
+
+        return int(body_id)
+
+    def launch_viewer(self):
+        """
+        Open MuJoCo passive viewer.
+
+        Usage:
+            with executor.launch_viewer() as viewer:
+                ...
+        """
+        if mujoco_viewer is None:
+            raise RuntimeError(
+                "mujoco.viewer is not available in this environment."
+            )
+
+        return mujoco_viewer.launch_passive(self.model, self.data)
+
     def reset(self) -> None:
         """
         Reset MuJoCo data to a stable replay state.
+
+        If config.reset_keyframe is "home", MuJoCo is immediately reset to the
+        home keyframe when the model is loaded.
         """
         if self.config.reset_keyframe is not None:
             reset_to_keyframe(
@@ -270,6 +378,311 @@ class MujocoTaskExecutor:
 
         mujoco.mj_forward(self.model, self.data)
 
+        self.reset_ee_paths()
+        self._record_ee_path_sample()
+
+    def reset_ee_paths(self) -> None:
+        """
+        Clear recorded end-effector paths.
+        """
+        self.left_ee_path.clear()
+        self.right_ee_path.clear()
+
+    def reset_command_points(self) -> None:
+        """
+        Clear command target points.
+        """
+        self.left_command_points.clear()
+        self.right_command_points.clear()
+
+    @staticmethod
+    def _append_unique_point(
+        points: list[np.ndarray],
+        point: np.ndarray,
+        *,
+        atol: float = 1e-9,
+    ) -> None:
+        p = np.asarray(point, dtype=float).reshape(3)
+
+        for old in points:
+            if np.linalg.norm(old - p) <= atol:
+                return
+
+        points.append(p.copy())
+
+    def _base_point_to_world(self, point_base: np.ndarray) -> np.ndarray:
+        """
+        Convert a point from OCP base frame to MuJoCo world frame.
+
+        OCP targets are generated in Pinocchio pelvis/base frame.
+        MuJoCo viewer.user_scn expects world-frame positions.
+        """
+        p_base = np.asarray(point_base, dtype=float).reshape(3)
+
+        body_pos = np.asarray(
+            self.data.xpos[self.command_frame_body_id],
+            dtype=float,
+        ).reshape(3)
+
+        body_rot = np.asarray(
+            self.data.xmat[self.command_frame_body_id],
+            dtype=float,
+        ).reshape(3, 3)
+
+        return body_pos + body_rot @ p_base
+
+    def _command_point_to_world(self, point: np.ndarray) -> np.ndarray:
+        """
+        Convert command point to world frame before drawing.
+        """
+        p = np.asarray(point, dtype=float).reshape(3)
+
+        if self.config.command_points_are_in_base_frame:
+            return self._base_point_to_world(p)
+
+        return p
+
+    def collect_command_points_from_plan(
+        self,
+        plan: TaskPlanResult,
+    ) -> None:
+        """
+        Collect left/right EE command target points from OCP solutions.
+
+        OCP targets are in Pinocchio pelvis/base frame, so they are converted
+        to MuJoCo world frame before drawing.
+        """
+        self.reset_command_points()
+
+        mujoco.mj_forward(self.model, self.data)
+
+        for stage in plan.stage_results:
+            if stage.ocp_solution is None:
+                continue
+
+            left_target_world = self._command_point_to_world(
+                stage.ocp_solution.left_ee_target,
+            )
+            right_target_world = self._command_point_to_world(
+                stage.ocp_solution.right_ee_target,
+            )
+
+            self._append_unique_point(
+                self.left_command_points,
+                left_target_world,
+            )
+            self._append_unique_point(
+                self.right_command_points,
+                right_target_world,
+            )
+
+    def _record_ee_path_sample(self) -> None:
+        """
+        Record current left/right EE site positions.
+        """
+        if not self.config.draw_ee_path:
+            return
+
+        left_pos = np.asarray(
+            self.data.site_xpos[self.left_ee_site_id],
+            dtype=float,
+        ).copy()
+
+        right_pos = np.asarray(
+            self.data.site_xpos[self.right_ee_site_id],
+            dtype=float,
+        ).copy()
+
+        self.left_ee_path.append(left_pos)
+        self.right_ee_path.append(right_pos)
+
+        max_points = int(self.config.ee_path_max_points)
+
+        if len(self.left_ee_path) > max_points:
+            self.left_ee_path = self.left_ee_path[-max_points:]
+
+        if len(self.right_ee_path) > max_points:
+            self.right_ee_path = self.right_ee_path[-max_points:]
+
+    def _add_line_to_user_scene(
+        self,
+        *,
+        viewer: Any,
+        p0: np.ndarray,
+        p1: np.ndarray,
+        rgba: tuple[float, float, float, float],
+    ) -> None:
+        """
+        Add one line segment to viewer.user_scn.
+        """
+        if viewer is None or not hasattr(viewer, "user_scn"):
+            return
+
+        scn = viewer.user_scn
+
+        if scn.ngeom >= scn.maxgeom:
+            return
+
+        p0_arr = np.asarray(p0, dtype=float).reshape(3)
+        p1_arr = np.asarray(p1, dtype=float).reshape(3)
+
+        if np.linalg.norm(p1_arr - p0_arr) < 1e-9:
+            return
+
+        geom = scn.geoms[scn.ngeom]
+
+        mujoco.mjv_connector(
+            geom,
+            mujoco.mjtGeom.mjGEOM_LINE,
+            float(self.config.ee_path_line_width),
+            p0_arr,
+            p1_arr,
+        )
+
+        geom.rgba[:] = np.asarray(rgba, dtype=float)
+        scn.ngeom += 1
+
+    def _add_sphere_to_user_scene(
+        self,
+        *,
+        viewer: Any,
+        position: np.ndarray,
+        radius: float,
+        rgba: tuple[float, float, float, float],
+    ) -> None:
+        """
+        Add one sphere point to viewer.user_scn.
+        """
+        if viewer is None or not hasattr(viewer, "user_scn"):
+            return
+
+        scn = viewer.user_scn
+
+        if scn.ngeom >= scn.maxgeom:
+            return
+
+        pos = np.asarray(position, dtype=float).reshape(3)
+        size = np.array([float(radius), 0.0, 0.0], dtype=float)
+        mat = np.eye(3, dtype=float).reshape(-1)
+        rgba_arr = np.asarray(rgba, dtype=float)
+
+        geom = scn.geoms[scn.ngeom]
+
+        mujoco.mjv_initGeom(
+            geom,
+            mujoco.mjtGeom.mjGEOM_SPHERE,
+            size,
+            pos,
+            mat,
+            rgba_arr,
+        )
+
+        scn.ngeom += 1
+
+    def _draw_ee_paths(self, viewer: Any | None) -> None:
+        """
+        Draw left/right EE paths into viewer.user_scn.
+        """
+        if not self.config.draw_ee_path:
+            return
+
+        if viewer is None or not hasattr(viewer, "user_scn"):
+            return
+
+        for i in range(len(self.left_ee_path) - 1):
+            self._add_line_to_user_scene(
+                viewer=viewer,
+                p0=self.left_ee_path[i],
+                p1=self.left_ee_path[i + 1],
+                rgba=self.config.left_ee_path_rgba,
+            )
+
+        for i in range(len(self.right_ee_path) - 1):
+            self._add_line_to_user_scene(
+                viewer=viewer,
+                p0=self.right_ee_path[i],
+                p1=self.right_ee_path[i + 1],
+                rgba=self.config.right_ee_path_rgba,
+            )
+
+    def _draw_command_points(self, viewer: Any | None) -> None:
+        """
+        Draw target command points.
+        """
+        if not self.config.draw_command_points:
+            return
+
+        if viewer is None or not hasattr(viewer, "user_scn"):
+            return
+
+        for p in self.left_command_points:
+            self._add_sphere_to_user_scene(
+                viewer=viewer,
+                position=p,
+                radius=self.config.command_point_size,
+                rgba=self.config.left_command_point_rgba,
+            )
+
+        for p in self.right_command_points:
+            self._add_sphere_to_user_scene(
+                viewer=viewer,
+                position=p,
+                radius=self.config.command_point_size,
+                rgba=self.config.right_command_point_rgba,
+            )
+
+    def _draw_current_ee_points(self, viewer: Any | None) -> None:
+        """
+        Draw current left/right EE site points.
+        """
+        if not self.config.draw_current_ee_points:
+            return
+
+        if viewer is None or not hasattr(viewer, "user_scn"):
+            return
+
+        left_pos = np.asarray(
+            self.data.site_xpos[self.left_ee_site_id],
+            dtype=float,
+        )
+
+        right_pos = np.asarray(
+            self.data.site_xpos[self.right_ee_site_id],
+            dtype=float,
+        )
+
+        self._add_sphere_to_user_scene(
+            viewer=viewer,
+            position=left_pos,
+            radius=self.config.current_ee_point_size,
+            rgba=self.config.left_current_ee_rgba,
+        )
+
+        self._add_sphere_to_user_scene(
+            viewer=viewer,
+            position=right_pos,
+            radius=self.config.current_ee_point_size,
+            rgba=self.config.right_current_ee_rgba,
+        )
+
+    def _draw_overlays(self, viewer: Any | None) -> None:
+        """
+        Draw all visual overlays.
+
+        This resets viewer.user_scn every frame, then redraws:
+            - command target points
+            - EE paths
+            - current EE points
+        """
+        if viewer is None or not hasattr(viewer, "user_scn"):
+            return
+
+        viewer.user_scn.ngeom = 0
+
+        self._draw_command_points(viewer)
+        self._draw_ee_paths(viewer)
+        self._draw_current_ee_points(viewer)
+
     def _set_g1_position_ctrl_from_q(
         self,
         q_ocp: np.ndarray,
@@ -277,8 +690,8 @@ class MujocoTaskExecutor:
         """
         Set G1 position actuator controls from OCP q.
 
-        This is not the primary replay mechanism. Direct state replay is.
-        This just helps MuJoCo actuators remain consistent when stepping.
+        Direct state replay remains the primary replay mechanism.
+        This keeps MuJoCo actuators consistent when stepping.
         """
         if not self.config.set_g1_position_ctrl:
             return
@@ -385,8 +798,39 @@ class MujocoTaskExecutor:
         if hasattr(viewer, "is_running") and not viewer.is_running():
             return False
 
+        self._draw_overlays(viewer)
         viewer.sync()
+
         return True
+
+    def keep_viewer_alive_until_closed(
+        self,
+        viewer: Any,
+        *,
+        print_message: bool = True,
+    ) -> None:
+        """
+        Keep GUI alive after the plan finishes.
+
+        The GUI only closes when the user manually closes the MuJoCo window.
+        """
+        if viewer is None:
+            return
+
+        if print_message:
+            print("")
+            print("[MuJoCo] Replay finished. Close the viewer window to exit.")
+
+        while True:
+            if hasattr(viewer, "is_running") and not viewer.is_running():
+                return
+
+            ok = self._sync_viewer(viewer)
+
+            if not ok:
+                return
+
+            time.sleep(0.03)
 
     def _sleep_realtime(
         self,
@@ -404,9 +848,6 @@ class MujocoTaskExecutor:
     ) -> bool:
         """
         Advance one visual sample.
-
-        If step_simulation=True, MuJoCo is stepped so gripper actuator dynamics
-        can move. Otherwise only mj_forward + viewer sync is used.
         """
         sample_dt = float(sample_dt)
 
@@ -415,10 +856,13 @@ class MujocoTaskExecutor:
 
         if step_simulation:
             substeps = self._num_substeps_for_sample(sample_dt)
+
             for _ in range(substeps):
                 mujoco.mj_step(self.model, self.data)
         else:
             mujoco.mj_forward(self.model, self.data)
+
+        self._record_ee_path_sample()
 
         ok = self._sync_viewer(viewer)
         self._sleep_realtime(sample_dt)
@@ -480,7 +924,7 @@ class MujocoTaskExecutor:
         viewer: Any | None,
     ) -> bool:
         """
-        Replay a q/v trajectory, optionally with gripper command trajectories.
+        Replay a q/v trajectory, optionally with gripper commands.
         """
         q_arr = np.asarray(q_traj, dtype=float)
 
@@ -503,9 +947,6 @@ class MujocoTaskExecutor:
         )
 
         for k in range(q_arr.shape[0]):
-            q_k = q_arr[k]
-            v_k = v_arr[k]
-
             left_command = self._sample_optional_traj(
                 left_gripper_traj,
                 k,
@@ -517,7 +958,10 @@ class MujocoTaskExecutor:
                 current_value=self.right_gripper_command,
             )
 
-            self._apply_ocp_state(q_ocp=q_k, v_ocp=v_k)
+            self._apply_ocp_state(
+                q_ocp=q_arr[k],
+                v_ocp=v_arr[k],
+            )
             self._set_gripper_commands(
                 left_command=left_command,
                 right_command=right_command,
@@ -641,7 +1085,7 @@ class MujocoTaskExecutor:
         """
         Execute one StageResult.
 
-        Execution order:
+        Order:
             1. OCP reference if available.
             2. Else gripper-only trajectory if available.
             3. Return-arm trajectory if available.
@@ -650,9 +1094,6 @@ class MujocoTaskExecutor:
         if self.config.print_stage:
             print(f"[MuJoCo] stage: {stage.step_name}")
 
-        # If OCP trajectory exists, replay it first.
-        # If gripper command also exists in this stage, run it in parallel
-        # with the OCP trajectory.
         if stage.has_ocp_reference:
             ok = self._replay_qv_trajectory(
                 q_traj=stage.ocp_q_ref,
@@ -670,7 +1111,6 @@ class MujocoTaskExecutor:
         else:
             gripper_was_consumed = False
 
-        # If this stage only contains gripper motion, replay it here.
         if stage.has_gripper_command and not gripper_was_consumed:
             ok = self._replay_gripper_only(
                 left_gripper_traj=stage.left_gripper_command_traj,
@@ -681,7 +1121,6 @@ class MujocoTaskExecutor:
             if not ok:
                 return False
 
-        # Return-arm trajectory happens after OCP/gripper part.
         if stage.has_return_trajectory:
             ok = self._replay_qv_trajectory(
                 q_traj=stage.q_return_traj,
@@ -709,31 +1148,49 @@ class MujocoTaskExecutor:
     def execute_plan(
         self,
         plan: TaskPlanResult,
+        *,
+        viewer: Any | None = None,
     ) -> None:
         """
         Execute a full task plan.
 
-        If config.show_viewer=True, this opens a MuJoCo passive viewer.
-        Otherwise execution is headless.
+        If viewer is provided, reuse it.
+        If config.show_viewer=True and viewer is None, this opens a MuJoCo
+        passive viewer.
         """
-        if self.config.show_viewer:
-            if mujoco_viewer is None:
-                raise RuntimeError(
-                    "mujoco.viewer is not available in this environment."
-                )
+        self.reset_ee_paths()
+        self.collect_command_points_from_plan(plan)
+        self._record_ee_path_sample()
 
-            with mujoco_viewer.launch_passive(self.model, self.data) as viewer:
+        if viewer is not None:
+            for stage in plan.stage_results:
+                ok = self.execute_stage(stage, viewer=viewer)
+
+                if not ok:
+                    print("[MuJoCo] viewer closed. Stop execution.")
+                    return
+
+            self._hold(
+                viewer=viewer,
+                duration=self.config.hold_final_time,
+            )
+            return
+
+        if self.config.show_viewer:
+            with self.launch_viewer() as local_viewer:
                 for stage in plan.stage_results:
-                    ok = self.execute_stage(stage, viewer=viewer)
+                    ok = self.execute_stage(stage, viewer=local_viewer)
 
                     if not ok:
                         print("[MuJoCo] viewer closed. Stop execution.")
                         return
 
                 self._hold(
-                    viewer=viewer,
+                    viewer=local_viewer,
                     duration=self.config.hold_final_time,
                 )
+
+                self.keep_viewer_alive_until_closed(local_viewer)
 
             return
 
